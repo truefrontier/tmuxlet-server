@@ -470,15 +470,15 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
     let (names_owned, route_label): (Vec<String>, Option<String>) = if let Some(router_cfg) =
         state.cfg.routers.get(&model)
     {
-        let last_user = openai::last_user_text(&parsed.messages);
-        let (class, classifier_ms) = classify_task(state, router_cfg, &last_user);
+        let (class, source, classifier_ms) = classify_task(state, router_cfg, &parsed.messages);
         let target = router_cfg.routes[&class].clone();
         let names = match router::resolve(&target, &state.cfg) {
             Ok(n) => n.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             Err(e) => return respond_err(req, 500, &e, "server_error", Some("router_error")),
         };
         log::info(&format!(
-            "{reqid} route {model} class={class} target={target} classifier_ms={classifier_ms}"
+            "{reqid} route {model} class={class} target={target} source={} classifier_ms={classifier_ms}",
+            source.as_str()
         ));
         (names, Some(format!("{class}/{target}")))
     } else {
@@ -564,7 +564,8 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>) {
                 None,
                 first,
             );
-            respond_json(req, 503, build_503_body(&errors, state.redact_errors));
+            let (status, body) = chain_error_response(&errors, state.redact_errors);
+            respond_json(req, status, body);
         }
     }
 }
@@ -672,7 +673,11 @@ fn stream_with_keepalive(
                     None,
                     first.as_deref(),
                 );
-                let body = build_503_body(&errors, redact);
+                // §4.3/R5: the transport status is already committed to 200 — the
+                // SSE headers went out before the chain ran — so an all-overflow
+                // chain cannot answer 400 here. Take the helper's *body*, which
+                // carries code: "context_length_exceeded", and drop its status.
+                let (_status, body) = chain_error_response(&errors, redact);
                 let _ = tx.send(format!("data: {body}\n\n").into_bytes());
                 let _ = tx.send(b"data: [DONE]\n\n".to_vec());
             }
@@ -820,6 +825,13 @@ fn record_success(state: &State, name: &str, latency_ms: u64) {
 }
 
 fn record_failure(state: &State, name: &str, err: &BackendError, latency_ms: u64) {
+    // §4.3: a context overflow says nothing about the backend's health — the
+    // backend is fine, the prompt does not fit. Keep it out of the cooldown
+    // bookkeeping entirely, or one long conversation benches a 32k local model
+    // for every short request that follows.
+    if let BackendError::Overflow(..) = err {
+        return record_overflow(state, name, err, latency_ms);
+    }
     // A4: mutate health under the lock, then RELEASE it before logging. log::line
     // can block on a stalled stderr pipe; blocking (or, before the log.rs fix,
     // panicking on EPIPE) while holding state.health would stall or poison the
@@ -842,6 +854,20 @@ fn record_failure(state: &State, name: &str, err: &BackendError, latency_ms: u64
     if let Some((secs, class)) = cooldown_log {
         log::info(&format!("cooldown {name} for {secs}s ({class})"));
     }
+}
+
+/// §4.3: record a context overflow without letting it read as ill-health.
+///
+/// `last_error`/`last_latency_ms` still move, so `/v1/backends` can explain why a
+/// leg was skipped. `consecutive_failures` is neither incremented **nor reset**
+/// (plan O4): an overflow is no more evidence of health than of ill-health, and
+/// zeroing the counter would let a chatty client launder a genuinely failing
+/// backend back into rotation. No cooldown is applied.
+fn record_overflow(state: &State, name: &str, err: &BackendError, latency_ms: u64) {
+    let mut h = state.health.lock().unwrap();
+    let e = h.entry(name.to_string()).or_default();
+    e.last_error = Some(err.to_string());
+    e.last_latency_ms = Some(latency_ms);
 }
 
 /// P-9: cooldown scaled by what a wasted retry costs.
@@ -887,15 +913,94 @@ fn build_503_body(errors: &[BackendError], redact: bool) -> String {
     .to_json()
 }
 
+/// §4.3: every leg reporting a context overflow means the client sent a request
+/// that nothing in the chain can serve — a 400, not the generic 503 that invites
+/// a pointless retry.
+///
+/// The rule is deliberately strict (plan O1). `run_chain` mixes real dispatch
+/// errors with synthetic skip markers (`"skipped: cooling Ns"`, `"skipped:
+/// budget"`) and `Busy` into one error vec, so a chain where one leg overflowed
+/// while another was merely benched still returns 503 — a retry in 60s would in
+/// fact work there, and a 400 would wrongly tell the client not to bother.
+fn all_overflow(errors: &[BackendError]) -> bool {
+    !errors.is_empty()
+        && errors
+            .iter()
+            .all(|e| matches!(e, BackendError::Overflow(..)))
+}
+
+/// The status and body for a chain that produced no winner.
+fn chain_error_response(errors: &[BackendError], redact: bool) -> (u16, String) {
+    if all_overflow(errors) {
+        (400, build_overflow_body(errors, redact))
+    } else {
+        (503, build_503_body(errors, redact))
+    }
+}
+
+fn build_overflow_body(errors: &[BackendError], redact: bool) -> String {
+    // Same redaction discipline as build_503_body (S-6): full per-leg strings
+    // normally, name+class only when bound non-loopback.
+    let summary = errors
+        .iter()
+        .map(|e| format!("{} ({})", e.backend_name(), e.class()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let details: Vec<String> = if redact {
+        errors
+            .iter()
+            .map(|e| format!("{} ({})", e.backend_name(), e.class()))
+            .collect()
+    } else {
+        errors.iter().map(|e| e.to_string()).collect()
+    };
+    openai::ErrorEnvelope::with_details(
+        format!("prompt exceeds the context window of every backend in the chain: {summary}"),
+        "invalid_request_error",
+        Some("context_length_exceeded"),
+        details,
+    )
+    .to_json()
+}
+
+/// Provenance of a routing decision. Phase 0 needs only the two classifier
+/// outcomes; §3.1 of the v2 spec widens this to nine variants and moves it to
+/// `route/mod.rs` in Phase 1. Deliberately not pre-declared in full: CI runs
+/// `clippy --all-targets -- -D warnings`, and seven unconstructed variants are a
+/// hard failure.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DecisionSource {
+    /// The classifier returned a class we could use.
+    Classifier,
+    /// We tried to be smart and could not — the classifier was missing, at its
+    /// concurrency cap, errored, or answered ambiguously. Distinct from routing
+    /// a model we simply do not know.
+    FallOpen,
+}
+
+impl DecisionSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            DecisionSource::Classifier => "classifier",
+            DecisionSource::FallOpen => "fall_open",
+        }
+    }
+}
+
 /// §5: classify the task via the router's classifier backend. Never fails the
-/// request — any error/timeout/garbage falls back to `fallback_class`.
+/// request — any error/timeout/garbage falls back to `fallback_class`, and every
+/// such path reports `FallOpen` so the fall-open rate is greppable in the logs.
 fn classify_task(
     state: &State,
     router_cfg: &crate::config::Router,
-    last_user: &str,
-) -> (String, u64) {
+    messages: &[openai::ChatMessage],
+) -> (String, DecisionSource, u64) {
     let classes: Vec<&str> = router_cfg.routes.keys().map(|s| s.as_str()).collect();
-    let truncated = truncate_tail(last_user, router_cfg.classifier_max_chars);
+    let truncated = classifier_input(
+        messages,
+        router_cfg.classifier_max_chars,
+        state.cfg.server.classifier_include_opening,
+    );
     let prompt = match &router_cfg.classifier_prompt {
         Some(tpl) => tpl
             .replace("{classes}", &classes.join(", "))
@@ -907,7 +1012,11 @@ fn classify_task(
         ),
     };
     let Some(classifier) = state.backends.get(&router_cfg.classifier) else {
-        return (router_cfg.fallback_class.clone(), 0);
+        return (
+            router_cfg.fallback_class.clone(),
+            DecisionSource::FallOpen,
+            0,
+        );
     };
     // U-20: honor the classifier backend's concurrency cap. At capacity, degrade
     // to the fallback class rather than spawning an uncounted session (the same
@@ -915,7 +1024,13 @@ fn classify_task(
     let _slot = match classifier.max_concurrent() {
         Some(max) => match ActiveSlot::try_acquire(&state.active, &router_cfg.classifier, max) {
             Some(slot) => Some(slot),
-            None => return (router_cfg.fallback_class.clone(), 0),
+            None => {
+                return (
+                    router_cfg.fallback_class.clone(),
+                    DecisionSource::FallOpen,
+                    0,
+                );
+            }
         },
         None => None,
     };
@@ -924,26 +1039,46 @@ fn classify_task(
     let start = Instant::now();
     let result = classifier.dispatch(&prompt, &raw, &state.env, timeout);
     let ms = start.elapsed().as_millis() as u64;
-    let class = match result {
+    let (class, source) = match result {
         Ok(r) => parse_class(&r.content, &router_cfg.routes, &router_cfg.fallback_class),
-        Err(_) => router_cfg.fallback_class.clone(),
+        Err(_) => (router_cfg.fallback_class.clone(), DecisionSource::FallOpen),
     };
-    (class, ms)
+    (class, source, ms)
 }
 
-fn parse_class(reply: &str, routes: &HashMap<String, String>, fallback: &str) -> String {
+/// §4.1: map a classifier reply onto one of the router's classes.
+///
+/// Pass 1 is an exact match and is unambiguous by construction — map keys are
+/// unique, so at most one can compare equal. Pass 2 is a substring match and only
+/// commits when **exactly one** class matches: a reply like "this is a code task,
+/// not a write task" hits both `code` and `write`, and which one won used to vary
+/// between runs of the same binary because `HashMap`'s `RandomState` reseeds per
+/// process. Ambiguity now falls open and says so.
+fn parse_class(
+    reply: &str,
+    routes: &HashMap<String, String>,
+    fallback: &str,
+) -> (String, DecisionSource) {
     let r = reply.trim().to_ascii_lowercase();
-    for k in routes.keys() {
-        if k.to_ascii_lowercase() == r {
-            return k.clone();
-        }
+
+    // Pass 1: exact match. Unambiguous by construction (keys are unique).
+    if let Some(k) = routes.keys().find(|k| k.to_ascii_lowercase() == r) {
+        return (k.clone(), DecisionSource::Classifier);
     }
-    for k in routes.keys() {
-        if r.contains(&k.to_ascii_lowercase()) {
-            return k.clone();
-        }
+
+    // Pass 2: substring — only when EXACTLY ONE class matches. Iterate a sorted
+    // key list so a future change here can't reintroduce order-dependence.
+    let mut keys: Vec<&String> = routes.keys().collect();
+    keys.sort_unstable();
+    let hits: Vec<&&String> = keys
+        .iter()
+        .filter(|k| r.contains(&k.to_ascii_lowercase()))
+        .collect();
+    match hits.as_slice() {
+        [only] => ((**only).clone(), DecisionSource::Classifier),
+        // 0 matches (nothing recognizable) or 2+ (ambiguous) both fall open.
+        _ => (fallback.to_string(), DecisionSource::FallOpen),
     }
-    fallback.to_string()
 }
 
 fn truncate_tail(s: &str, max: usize) -> String {
@@ -952,6 +1087,48 @@ fn truncate_tail(s: &str, max: usize) -> String {
         return s.to_string();
     }
     chars[chars.len() - max..].iter().collect()
+}
+
+/// Mirror image of `truncate_tail`: keep the **first** `max` chars. Char-based,
+/// not byte-based, so it cannot split a UTF-8 sequence.
+fn truncate_head(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    chars[..max].iter().collect()
+}
+
+/// §4.2: build what the classifier is actually shown.
+///
+/// v0.2.0 tail-truncated the *latest* user message, which on turn 12 of an agent
+/// run hands the classifier "yes, continue" — zero routing signal — and then logs
+/// a confident class. Show it both ends of the conversation instead: the opening
+/// task head-truncated (intent is at the start) plus the latest turn
+/// tail-truncated (the ask is at the end), joined by a marker so the classifier
+/// can tell which is current.
+///
+/// The separator is charged to the budget, so the result is always at most `max`
+/// chars — which is what `classifier_max_chars` promises whoever set it. A short
+/// opening donates its unused remainder to the latest turn (plan O2).
+fn classifier_input(messages: &[openai::ChatMessage], max: usize, include_opening: bool) -> String {
+    let latest = openai::last_user_text(messages);
+    // The opt-out, and the degenerate single-turn case: tail-truncate the latest
+    // turn over the whole budget. Byte-for-byte v0.2.0 behavior.
+    if !include_opening || openai::user_message_count(messages) < 2 {
+        return truncate_tail(&latest, max);
+    }
+    const SEP: &str = "\n\n[latest message]\n";
+    let body = max.saturating_sub(SEP.chars().count());
+    if body == 0 {
+        // No room for both halves plus the marker; the latest turn is the safer
+        // half to keep, and the `<= max` guarantee holds.
+        return truncate_tail(&latest, max);
+    }
+    let head = truncate_head(&openai::first_user_text(messages), body * 60 / 100);
+    // O2: whatever the opening did not use goes to the latest turn.
+    let tail = truncate_tail(&latest, body - head.chars().count());
+    format!("{head}{SEP}{tail}")
 }
 
 /// F-3: run one request handler, recovering from a panic so the worker loop
@@ -1065,17 +1242,264 @@ mod tests {
         );
     }
 
+    /// Build the two-class route table T1-T5 share, fresh each call so every
+    /// `HashMap` gets its own `RandomState` seed.
+    fn routes(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn msg(role: &str, text: &str) -> openai::ChatMessage {
+        openai::ChatMessage {
+            role: role.to_string(),
+            content: openai::MessageContent::Text(text.to_string()),
+            name: None,
+        }
+    }
+
     #[test]
-    fn parse_class_matches_exact_then_contains_then_fallback() {
-        let mut routes = HashMap::new();
-        routes.insert("research".to_string(), "best".to_string());
-        routes.insert("execution".to_string(), "fast".to_string());
-        assert_eq!(parse_class("RESEARCH", &routes, "execution"), "research");
+    fn parse_class_exact_match_wins_over_substring() {
+        // T1: `code` and `code-review` both hit on the substring pass, so the
+        // exact match must short-circuit before it ever runs.
+        let r = routes(&[("code", "a"), ("code-review", "b")]);
         assert_eq!(
-            parse_class("I think this is execution work", &routes, "research"),
-            "execution"
+            parse_class("code", &r, "code-review"),
+            ("code".to_string(), DecisionSource::Classifier)
         );
-        assert_eq!(parse_class("nonsense", &routes, "execution"), "execution");
+    }
+
+    #[test]
+    fn parse_class_single_substring_match_is_classifier() {
+        // T2: the v0.2.0 test, retyped for the tuple. Exactly one class appears
+        // in the reply, so the substring pass still commits.
+        let r = routes(&[("research", "best"), ("execution", "fast")]);
+        assert_eq!(
+            parse_class("RESEARCH", &r, "execution"),
+            ("research".to_string(), DecisionSource::Classifier)
+        );
+        assert_eq!(
+            parse_class("I think this is execution work", &r, "research"),
+            ("execution".to_string(), DecisionSource::Classifier)
+        );
+    }
+
+    #[test]
+    fn parse_class_ambiguous_reply_falls_open_across_100_maps() {
+        // T3: the nondeterminism this fix exists for. `RandomState` reseeds per
+        // HashMap *construction*, so one map is a coin flip that passes ~50% of
+        // the time against the old code — build a fresh one every iteration.
+        for i in 0..100 {
+            let r = routes(&[("code", "a"), ("write", "b")]);
+            assert_eq!(
+                parse_class("this is a code task, not a write task", &r, "general"),
+                ("general".to_string(), DecisionSource::FallOpen),
+                "iteration {i}: two classes matched, so the reply is unusable"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_class_no_match_falls_open() {
+        // T4: zero matches is FallOpen, not Classifier — §3.1 insists the two are
+        // different things, and today both used to land in the same silent path.
+        let r = routes(&[("research", "best"), ("execution", "fast")]);
+        assert_eq!(
+            parse_class("nonsense", &r, "execution"),
+            ("execution".to_string(), DecisionSource::FallOpen)
+        );
+    }
+
+    #[test]
+    fn parse_class_is_case_and_whitespace_insensitive() {
+        // T5: guards the trim().to_ascii_lowercase() the rewrite must preserve.
+        let r = routes(&[("research", "best"), ("execution", "fast")]);
+        assert_eq!(
+            parse_class("  RESEARCH \n", &r, "execution"),
+            ("research".to_string(), DecisionSource::Classifier)
+        );
+    }
+
+    /// A 12-message agent run: a real opening task, then filler, ending on the
+    /// content-free continuation that used to be all the classifier ever saw.
+    fn agent_run() -> Vec<openai::ChatMessage> {
+        let mut m = vec![msg("user", "Refactor the auth module to use JWTs")];
+        for i in 0..5 {
+            m.push(msg("assistant", &format!("step {i}")));
+            m.push(msg("user", "ok"));
+        }
+        m.push(msg("user", "yes, continue"));
+        m
+    }
+
+    #[test]
+    fn classifier_input_combines_opening_and_latest() {
+        // T6: the defect, stated as an assertion.
+        let got = classifier_input(&agent_run(), 4000, true);
+        assert!(
+            got.contains("Refactor the auth module to use JWTs"),
+            "opening task missing: {got}"
+        );
+        assert!(got.contains("yes, continue"), "latest turn missing: {got}");
+    }
+
+    #[test]
+    fn classifier_input_respects_the_budget_and_the_60_40_split() {
+        // T7: both halves far over budget. Asserts on the actual boundary chars,
+        // not just lengths — a head/tail swap is the bug this fix exists to stop.
+        let opening: String = "abcdefghij".repeat(20); // 200 chars
+        let latest: String = "0123456789".repeat(20); // 200 chars
+        let messages = vec![
+            msg("user", &opening),
+            msg("assistant", "..."),
+            msg("user", &latest),
+        ];
+        const MAX: usize = 119; // 100 body + the 19-char separator
+        let got = classifier_input(&messages, MAX, true);
+        assert!(
+            got.chars().count() <= MAX,
+            "budget blown: {} > {MAX}",
+            got.chars().count()
+        );
+        let (head, tail) = got.split_once("\n\n[latest message]\n").expect("separator");
+        assert_eq!(head.chars().count(), 60, "head budget is 60% of the body");
+        assert_eq!(tail.chars().count(), 40, "tail gets the remainder");
+        assert!(
+            head.starts_with("abcdefghij"),
+            "opening must be HEAD-truncated: {head}"
+        );
+        assert!(
+            tail.ends_with("0123456789"),
+            "latest must be TAIL-truncated: {tail}"
+        );
+    }
+
+    #[test]
+    fn classifier_input_single_user_message_gets_the_whole_budget() {
+        // T8: one user message → v0.2.0 behavior, no separator.
+        let only = "x".repeat(500);
+        let messages = vec![msg("system", "be brief"), msg("user", &only)];
+        let got = classifier_input(&messages, 100, true);
+        assert_eq!(got, truncate_tail(&only, 100));
+        assert!(!got.contains("[latest message]"), "no separator: {got}");
+    }
+
+    #[test]
+    fn classifier_include_opening_false_reproduces_v0_2_0() {
+        // T9: the opt-out is byte-for-byte, which is the promise the key makes.
+        let messages = agent_run();
+        assert_eq!(
+            classifier_input(&messages, 40, false),
+            truncate_tail(&openai::last_user_text(&messages), 40)
+        );
+    }
+
+    #[test]
+    fn classifier_input_is_char_safe_on_multibyte_input() {
+        // T10: truncate_head is new index arithmetic; a byte-slice mistake would
+        // panic here, or split a 4-byte sequence into invalid UTF-8.
+        let emoji = "\u{1F600}".repeat(100);
+        let messages = vec![
+            msg("user", &emoji),
+            msg("assistant", "…"),
+            msg("user", &emoji),
+        ];
+        let got = classifier_input(&messages, 60, true);
+        assert!(got.chars().count() <= 60);
+        let (head, tail) = got.split_once("\n\n[latest message]\n").expect("separator");
+        // Every surviving char is a whole emoji — no sequence was split.
+        assert!(head.chars().all(|c| c == '\u{1F600}'), "head: {head:?}");
+        assert!(tail.chars().all(|c| c == '\u{1F600}'), "tail: {tail:?}");
+        // The head path alone, on a budget that lands mid-sequence.
+        assert_eq!(truncate_head(&emoji, 3).chars().count(), 3);
+    }
+
+    #[test]
+    fn overflow_does_not_cool_or_count_against_health() {
+        // T14: an overflow must move neither consecutive_failures nor
+        // cooling_until — and the same call with a Timeout must move both, so a
+        // short-circuit that swallowed every error class would fail here.
+        const C: &str = r#"
+[server]
+listen = "127.0.0.1:3456"
+default_chain = "echo"
+env_source = "process"
+cooldown = true
+
+[backends.echo]
+type = "cli"
+bin = "/bin/echo"
+"#;
+        let state = State {
+            cfg: crate::config::parse(C).unwrap(),
+            env: crate::env::Env::capture("process", "/bin/sh", 1),
+            backends: HashMap::new(),
+            auth_token: None,
+            redact_errors: false,
+            health: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashMap::new()),
+        };
+        let overflow = BackendError::Overflow("echo".into(), "maximum context length".into());
+        record_failure(&state, "echo", &overflow, 12);
+        {
+            let h = state.health.lock().unwrap();
+            let e = h.get("echo").expect("overflow still records last_error");
+            assert_eq!(e.consecutive_failures, 0, "overflow is not a health signal");
+            assert!(e.cooling_until.is_none(), "overflow must not cool a leg");
+            assert_eq!(e.last_latency_ms, Some(12));
+            assert!(
+                e.last_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("context overflow"),
+                "/v1/backends must still explain the skip: {:?}",
+                e.last_error
+            );
+        }
+        record_failure(&state, "echo", &BackendError::Timeout("echo".into()), 34);
+        let h = state.health.lock().unwrap();
+        let e = h.get("echo").unwrap();
+        assert_eq!(e.consecutive_failures, 1, "a real failure still counts");
+        assert!(e.cooling_until.is_some(), "a real failure still cools");
+    }
+
+    #[test]
+    fn chain_error_response_is_400_only_when_every_leg_overflowed() {
+        // T16's unit-level twin, and the O1 rule in one place: strict all().
+        let all = vec![
+            BackendError::Overflow("a".into(), "maximum context length".into()),
+            BackendError::Overflow("b".into(), "prompt is too long".into()),
+        ];
+        let (status, body) = chain_error_response(&all, false);
+        assert_eq!(status, 400);
+        assert!(body.contains("context_length_exceeded"), "{body}");
+        assert!(body.contains("invalid_request_error"), "{body}");
+
+        // One overflow plus a synthetic skip marker is still 503: a retry in 60s
+        // would work, and a 400 would wrongly tell the client not to bother.
+        let mixed = vec![
+            BackendError::Overflow("a".into(), "maximum context length".into()),
+            BackendError::Backend("b".into(), "skipped: cooling 42s".into()),
+        ];
+        assert_eq!(chain_error_response(&mixed, false).0, 503);
+        assert_eq!(chain_error_response(&[], false).0, 503, "empty is not 400");
+    }
+
+    #[test]
+    fn overflow_body_redacts_upstream_detail() {
+        // S-6 discipline applies to the new 400 body exactly as to the 503 one.
+        let errs = vec![BackendError::Overflow(
+            "ollama".into(),
+            "maximum context length is 8192, requested 41002".into(),
+        )];
+        let redacted = build_overflow_body(&errs, true);
+        assert!(redacted.contains("ollama (context overflow)"), "{redacted}");
+        assert!(
+            !redacted.contains("41002"),
+            "redacted must not leak: {redacted}"
+        );
+        assert!(build_overflow_body(&errs, false).contains("41002"));
     }
 
     #[test]

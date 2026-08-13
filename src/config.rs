@@ -67,6 +67,14 @@ pub struct Server {
     /// behavior. When set, matching Origins are echoed and OPTIONS is answered.
     #[serde(default)]
     pub cors_origins: Vec<String>,
+    /// §4.2: show the classifier the opening user task as well as the latest
+    /// turn, instead of the latest turn alone. **Server-wide** — the only
+    /// classifier key that lives outside `[routers.<name>]`, deliberately, so one
+    /// line pins v0.2.0 behavior for every router rather than five. The
+    /// neighbouring `classifier_max_chars` *is* per-router; do not assume this
+    /// one follows it. Opt-out, because it changes routing quality.
+    #[serde(default = "default_true")]
+    pub classifier_include_opening: bool,
 }
 
 fn default_timeout() -> u64 {
@@ -438,6 +446,7 @@ const SERVER_KEYS: &[&str] = &[
     "cooldown_secs",
     "strict_models",
     "cors_origins",
+    "classifier_include_opening",
 ];
 const CHAIN_KEYS: &[&str] = &["order"];
 const TMUXLET_KEYS: &[&str] = &[
@@ -877,6 +886,53 @@ order = ["agy", "ollama-kimi", "claude-thinking"]
             w.iter()
                 .any(|x| x.contains("backends.ollama-kimi.prompt_mode")),
             "prompt_mode on an api backend should be an unknown key: {w:?}"
+        );
+    }
+
+    #[test]
+    fn classifier_include_opening_defaults_true_and_lints_clean() {
+        // §4.2 / O5: the key is server-wide and opt-out. Omitting it means true,
+        // setting it under [server] is a known key, and the same name under a
+        // router is *not* — pinning the home against a move back to per-router,
+        // which would silently ignore an operator's [server] line.
+        let cfg = parse(SAMPLE).unwrap();
+        assert!(
+            cfg.server.classifier_include_opening,
+            "an omitted classifier_include_opening must default to true"
+        );
+
+        let opted_out = SAMPLE.replace(
+            "log_level = \"info\"",
+            "log_level = \"info\"\nclassifier_include_opening = false",
+        );
+        let cfg = parse(&opted_out).unwrap();
+        assert!(
+            !cfg.server.classifier_include_opening,
+            "an explicit false must survive parsing"
+        );
+        let w = lint(&cfg, &opted_out);
+        assert!(
+            !w.iter().any(|x| x.contains("classifier_include_opening")),
+            "server.classifier_include_opening must be a known server key: {w:?}"
+        );
+
+        let on_router = format!(
+            r#"{SAMPLE}
+[routers.x]
+classifier = "agy"
+fallback_class = "general"
+classifier_include_opening = false
+
+[routers.x.routes]
+general = "default"
+"#
+        );
+        let cfg = parse(&on_router).unwrap();
+        let w = lint(&cfg, &on_router);
+        assert!(
+            w.iter()
+                .any(|x| x.contains("routers.x.classifier_include_opening")),
+            "the key has no per-router home and must lint as unknown: {w:?}"
         );
     }
 

@@ -25,6 +25,11 @@ pub enum BackendError {
     Parse(String, String),
     /// U-20: backend at its max_concurrent cap; the chain advances.
     Busy(String),
+    /// §4.3: the prompt exceeds this backend's context window. Not a health
+    /// signal — the backend is fine, the prompt does not fit. Carries the backend
+    /// name and the upstream's own detail, so the 400 we return is actionable
+    /// ("maximum context length is 32768 tokens, requested 41002").
+    Overflow(String, String),
 }
 
 impl fmt::Display for BackendError {
@@ -43,6 +48,13 @@ impl fmt::Display for BackendError {
             }
             BackendError::Parse(n, m) => write!(f, "[{n}] parse error: {m}"),
             BackendError::Busy(n) => write!(f, "[{n}] busy (max_concurrent reached)"),
+            BackendError::Overflow(n, d) => {
+                if d.is_empty() {
+                    write!(f, "[{n}] context overflow")
+                } else {
+                    write!(f, "[{n}] context overflow: {d}")
+                }
+            }
         }
     }
 }
@@ -57,7 +69,8 @@ impl BackendError {
             | BackendError::Backend(n, _)
             | BackendError::Http(n, _, _)
             | BackendError::Parse(n, _)
-            | BackendError::Busy(n) => n,
+            | BackendError::Busy(n)
+            | BackendError::Overflow(n, _) => n,
         }
     }
 
@@ -74,8 +87,34 @@ impl BackendError {
             },
             BackendError::Parse(_, _) => "parse error",
             BackendError::Busy(_) => "busy",
+            BackendError::Overflow(_, _) => "context overflow",
         }
     }
+}
+
+/// §4.3: does this upstream response say "your prompt does not fit"?
+///
+/// Deliberately narrow: HTTP **400** *and* a body naming a context error. 413 and
+/// 422 do **not** count — they are too ambiguous across upstreams, and a false
+/// positive silently skips a healthy leg without ever cooling it, which is a
+/// worse failure than the one this exists to fix.
+///
+/// **Only `api` backends can reach this today.** The rule keys on an HTTP status,
+/// and `BackendError::Http` is constructed in `backend/api.rs` alone. A `tmuxlet`
+/// or `cli` backend that overflows surfaces as `Exit`/`Backend` with no status
+/// and still cools exactly as before. The common local-model shape
+/// (Ollama/llama.cpp behind `type = "api"` on 127.0.0.1) *is* covered; widening
+/// to text-pattern-only detection with no status to gate on is exactly the
+/// false-positive risk the narrow rule avoids.
+pub fn is_context_overflow(status: u16, body: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let b = body.to_ascii_lowercase();
+    b.contains("context_length_exceeded")
+        || b.contains("maximum context length")
+        || b.contains("prompt is too long")
+        || b.contains("context window")
 }
 
 pub struct TmuxletBackend {
@@ -379,6 +418,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn overflow_error_classifies_and_names_its_backend() {
+        let e =
+            BackendError::Overflow("agy".into(), "maximum context length is 8192 tokens".into());
+        assert_eq!(e.class(), "context overflow");
+        assert_eq!(e.backend_name(), "agy");
+        let s = e.to_string();
+        assert!(
+            s.contains("agy") && s.contains("8192 tokens"),
+            "must name both the backend and the upstream detail: {s}"
+        );
+        assert_eq!(
+            BackendError::Overflow("agy".into(), String::new()).to_string(),
+            "[agy] context overflow",
+            "an empty detail must not leave a dangling ': '"
+        );
+    }
+
+    #[test]
+    fn is_context_overflow_requires_400_plus_a_body_match() {
+        // §4.3: a hit needs both the 400 and a body naming a context error; the
+        // body match is case-insensitive.
+        let hits: &[(u16, &str)] = &[
+            (400, "context_length_exceeded"),
+            (400, "maximum context length"),
+            (400, "prompt is too long"),
+            (400, "context window"),
+            (400, "This model's Maximum Context Length is 8192 tokens"),
+        ];
+        // The 413 and 422 rows encode a deliberate decision, not an oversight:
+        // those statuses are too ambiguous across upstreams, and a false positive
+        // silently skips a healthy leg without cooling it. A future "helpful"
+        // widening has to break this test to undo the choice.
+        let misses: &[(u16, &str)] = &[
+            (413, "maximum context length"),
+            (422, "maximum context length"),
+            (400, "invalid api key"),
+            (500, "maximum context length"),
+            (200, "maximum context length"),
+        ];
+        for (status, body) in hits {
+            assert!(
+                is_context_overflow(*status, body),
+                "{status} + {body:?} must read as overflow"
+            );
+        }
+        for (status, body) in misses {
+            assert!(
+                !is_context_overflow(*status, body),
+                "{status} + {body:?} must not read as overflow"
+            );
+        }
+    }
     #[test]
     fn builds_runtime_backend_from_config() {
         let cfg = crate::config::parse(

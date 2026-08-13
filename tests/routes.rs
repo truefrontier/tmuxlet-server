@@ -1,6 +1,9 @@
 //! Route classification: /v1/models listing, 404 envelope, reserved 501.
 mod common;
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
 fn config(port: u16) -> String {
     format!(
         r#"
@@ -576,5 +579,196 @@ fn body_cap_413_at_boundary() {
     assert_ne!(
         s_at, 413,
         "a body at exactly the cap must not be rejected by it"
+    );
+}
+
+/// Bind `port` and, on a background thread, answer exactly one HTTP request with
+/// the given raw `response` (same helper as tests/api_backend.rs). One listener
+/// answers one request, so every leg of a chain needs its own.
+fn mock_upstream(port: u16, response: String) -> thread::JoinHandle<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind mock upstream");
+    thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        // Read headers, then drain the Content-Length body so the client's write
+        // completes cleanly before we respond and close.
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        let mut header_end = None;
+        while header_end.is_none() {
+            match sock.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    header_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+                }
+                Err(_) => break,
+            }
+        }
+        if let Some(he) = header_end {
+            let head = String::from_utf8_lossy(&buf[..he]).to_ascii_lowercase();
+            let clen = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut remaining = clen.saturating_sub(buf.len() - (he + 4));
+            while remaining > 0 {
+                match sock.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => remaining = remaining.saturating_sub(n),
+                    Err(_) => break,
+                }
+            }
+        }
+        let _ = sock.write_all(response.as_bytes());
+        let _ = sock.flush();
+    })
+}
+
+fn http_response(status: u16, reason: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+/// The upstream shape `is_context_overflow` keys on: HTTP 400 whose body names
+/// "maximum context length". Anything else (500, a 400 without a marker) is a
+/// plain `Http` error and cools the leg as before.
+fn overflow_response() -> String {
+    http_response(
+        400,
+        "Bad Request",
+        r#"{"error":{"message":"This model's maximum context length is 8192 tokens"}}"#,
+    )
+}
+
+/// Two `api` legs in one chain, each pointed at its own mock upstream. Only
+/// `api` backends can produce `Overflow` (the rule keys on an HTTP status).
+fn two_leg_api_config(port: u16, leg1: u16, leg2: u16) -> String {
+    format!(
+        r#"
+[server]
+listen = "127.0.0.1:{port}"
+default_chain = "pair"
+env_source = "process"
+
+[backends.leg1]
+type = "api"
+base_url = "http://127.0.0.1:{leg1}/v1"
+model = "leg1-model"
+
+[backends.leg2]
+type = "api"
+base_url = "http://127.0.0.1:{leg2}/v1"
+model = "leg2-model"
+
+[chains.pair]
+order = ["leg1", "leg2"]
+"#
+    )
+}
+
+#[test]
+fn all_legs_overflow_returns_400_context_length_exceeded() {
+    // §4.3: a chain where every leg reports "your prompt does not fit" is a client
+    // problem, so it answers 400 with the OpenAI-shaped overflow code rather than
+    // the 503 that invites a pointless retry.
+    let (p1, p2) = (common::free_port(), common::free_port());
+    let _m1 = mock_upstream(p1, overflow_response());
+    let _m2 = mock_upstream(p2, overflow_response());
+    let server = common::start(&two_leg_api_config(common::free_port(), p1, p2));
+
+    let (status, body) = common::post_json(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"pair","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(status, 400, "an all-overflow chain must not 503: {body}");
+    assert!(
+        body.contains(r#""code":"context_length_exceeded""#),
+        "overflow code: {body}"
+    );
+    assert!(
+        body.contains(r#""type":"invalid_request_error""#),
+        "overflow type: {body}"
+    );
+
+    // O4, observed from outside: an overflow says nothing about backend health, so
+    // neither leg cooled and neither counted a failure. Two legs, two "ok" states.
+    let (hs, hb) = common::get(&format!("{}/v1/backends", server.base));
+    assert_eq!(hs, 200, "body: {hb}");
+    assert_eq!(
+        hb.matches(r#""state":"ok""#).count(),
+        2,
+        "an overflow must not bench a healthy backend: {hb}"
+    );
+    assert_eq!(
+        hb.matches(r#""consecutive_failures":0"#).count(),
+        2,
+        "an overflow must not count as a failure: {hb}"
+    );
+}
+
+#[test]
+fn a_mixed_overflow_and_real_failure_stays_503() {
+    // O1: the all-overflow rule is strict on purpose. Leg 2 failed for a reason a
+    // retry could fix, so the chain keeps the retryable 503 — "any overflow -> 400"
+    // would wrongly tell the client not to bother.
+    let (p1, p2) = (common::free_port(), common::free_port());
+    let _m1 = mock_upstream(p1, overflow_response());
+    let _m2 = mock_upstream(
+        p2,
+        http_response(500, "Internal Server Error", r#"{"error":"boom"}"#),
+    );
+    let server = common::start(&two_leg_api_config(common::free_port(), p1, p2));
+
+    let (status, body) = common::post_json(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"pair","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(
+        status, 503,
+        "one real failure keeps the chain at 503: {body}"
+    );
+    assert!(body.contains("all_backends_failed"), "body: {body}");
+}
+
+#[test]
+fn streaming_all_legs_overflow_carries_the_overflow_code_in_band() {
+    // R5: the asymmetry with the non-streaming case is deliberate and documented in
+    // stream_with_keepalive — the SSE headers are committed before the chain runs,
+    // so the transport is already 200 and the overflow can only travel in-band.
+    let (p1, p2) = (common::free_port(), common::free_port());
+    let _m1 = mock_upstream(p1, overflow_response());
+    let _m2 = mock_upstream(p2, overflow_response());
+    let server = common::start(&two_leg_api_config(common::free_port(), p1, p2));
+
+    let (status, content_type, body) = common::post_collect(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"pair","stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(
+        status, 200,
+        "SSE transport status is committed early: {body}"
+    );
+    assert!(
+        content_type.contains("text/event-stream"),
+        "wrong SSE content-type: {content_type:?}"
+    );
+    let frame = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .find(|f| *f != "[DONE]")
+        .expect("an in-band error frame before [DONE]");
+    assert!(
+        frame.contains(r#""code":"context_length_exceeded""#),
+        "the overflow code must survive in the frame body: {frame}"
+    );
+    assert!(
+        body.trim_end().ends_with("data: [DONE]"),
+        "stream not terminated by [DONE]: {body}"
     );
 }

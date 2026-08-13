@@ -121,11 +121,15 @@ pub fn dispatch(
         }
     })?;
     if !(200..300).contains(&status) {
-        return Err(BackendError::Http(
-            b.name.clone(),
-            status,
-            error_snippet(&resp),
-        ));
+        let detail = error_snippet(&resp);
+        // §4.3: match against the FULL body, not the snippet — error_snippet caps
+        // at 300 chars, and an upstream that wraps its message in a verbose
+        // envelope could push the marker past the cap. The snippet is still what
+        // we store.
+        if super::is_context_overflow(status, &resp) {
+            return Err(BackendError::Overflow(b.name.clone(), detail));
+        }
+        return Err(BackendError::Http(b.name.clone(), status, detail));
     }
     let content = extract_content(&b.name, &resp)?;
     Ok(DispatchResult {

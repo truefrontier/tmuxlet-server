@@ -75,6 +75,12 @@ order = ["claude-thinking", "agy"]
 # cooldown_secs = 60                # P-9: base cooldown for rate-limit / http failures
 # strict_models = false             # U-3: reject unknown models (404) vs fall back to default_chain
 # cors_origins = ["http://localhost:5173"]  # U-10: browser CORS allowlist (exact origins; no wildcard)
+# classifier_include_opening = true # §4.2: show the classifier the opening task
+#                                   #   AND the latest turn (60/40 char split),
+#                                   #   not just the latest turn — which on turn 12
+#                                   #   of an agent run is "yes, continue".
+#                                   #   Server-wide (the only classifier key that
+#                                   #   is not per-router); false = v0.2.0 behavior.
 
 # ── Per-backend optional keys ───────────────────────────────────────────────
 # All backend types:
@@ -110,7 +116,8 @@ order = ["claude-thinking", "agy"]
 #   classifier = "ollama-kimi"      # a defined backend that labels the task
 #   fallback_class = "execution"    # class used when classification fails / times out
 #   classifier_timeout_secs = 5     # classifier dispatch timeout
-#   classifier_max_chars = 4000     # truncate the classifier input to the last N chars
+#   classifier_max_chars = 4000     # budget for the whole classifier input (see
+#                                   #   classifier_include_opening in [server] above), in chars
 #   classifier_prompt = "..."       # override the default classify prompt ({classes}/{input})
 #   [routers.smart.routes]          # class -> chain or backend
 #   research = "thinking"

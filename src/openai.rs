@@ -99,6 +99,23 @@ pub fn last_user_text(messages: &[ChatMessage]) -> String {
         .unwrap_or_default()
 }
 
+/// §4.2: the text of the *first* user message — the opening task. Paired with
+/// `last_user_text` to build the classifier input, because a conversation's
+/// intent lives at its start and the current ask lives at its end.
+pub fn first_user_text(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| content_to_text(&m.content))
+        .unwrap_or_default()
+}
+
+/// §4.2: how many `role == "user"` messages the conversation carries. One (or
+/// zero) means there is no separate opening task to show the classifier.
+pub fn user_message_count(messages: &[ChatMessage]) -> usize {
+    messages.iter().filter(|m| m.role == "user").count()
+}
+
 /// U-14: how a backend shapes the request into a single prompt string.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum PromptMode {
