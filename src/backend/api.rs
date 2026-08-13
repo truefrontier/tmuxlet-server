@@ -175,7 +175,11 @@ pub fn dispatch_stream(
         .and_then(|k| env.get(k).map(str::to_string));
 
     let mut content = String::new();
-    let mut carry = String::new();
+    // Bytes, not a String: a relay boundary lands wherever TCP put it, and
+    // decoding each slice in isolation with from_utf8_lossy turns a multi-byte
+    // sequence straddling that boundary into U+FFFD. Any non-ASCII answer would
+    // acquire replacement characters at random offsets.
+    let mut carry: Vec<u8> = Vec::new();
     let mut alive = true;
     let (status, resp, retry_after) = http_client::post_json_stream(
         &scheme,
@@ -188,11 +192,14 @@ pub fn dispatch_stream(
         b.max_response_bytes as usize,
         b.ca_file.as_deref(),
         &mut |bytes| {
-            carry.push_str(&String::from_utf8_lossy(bytes));
-            // SSE frames are separated by a blank line; hold any partial tail.
-            while let Some(i) = carry.find("\n\n") {
-                let frame: String = carry.drain(..i + 2).collect();
-                for line in frame.lines() {
+            carry.extend_from_slice(bytes);
+            // SSE frames are separated by a blank line; hold any partial tail. Both
+            // LF and CRLF framing are legal per the SSE spec, and upstreams use
+            // both — accepting only "\n\n" made a CRLF stream yield no deltas at
+            // all, which scores as an empty answer rather than as a parse problem.
+            while let Some((end, sep)) = next_frame_end(&carry) {
+                let frame = carry.drain(..end + sep).collect::<Vec<u8>>();
+                for line in String::from_utf8_lossy(&frame).lines() {
                     let Some(data) = line.strip_prefix("data:") else {
                         continue;
                     };
@@ -240,6 +247,23 @@ pub fn dispatch_stream(
     })
 }
 
+/// Find the end of the first complete SSE frame: `(offset, separator length)`.
+///
+/// A frame is terminated by a blank line, which is `\n\n` or `\r\n\r\n`
+/// depending on the upstream. Returns `None` while only a partial frame is
+/// buffered, so the caller holds it for the next relay.
+fn next_frame_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2));
+    let crlf = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| (i, 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (x, y) => x.or(y),
+    }
+}
+
 /// Pull `choices[0].delta.content` out of one SSE data payload. `None` for the
 /// role-priming frame and anything else without text — those are not errors.
 fn delta_text(data: &str) -> Option<String> {
@@ -256,6 +280,19 @@ fn delta_text(data: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_boundaries_handle_both_lf_and_crlf() {
+        // Both are legal SSE framing and upstreams use both. Accepting only LF
+        // meant a CRLF stream produced no deltas and scored as an empty answer.
+        assert_eq!(next_frame_end(b"data: x\n\nrest"), Some((7, 2)));
+        assert_eq!(next_frame_end(b"data: x\r\n\r\nrest"), Some((7, 4)));
+        // A partial frame is held for the next relay, not consumed.
+        assert_eq!(next_frame_end(b"data: partial"), None);
+        assert_eq!(next_frame_end(b"data: x\r\n"), None);
+        // Whichever terminator comes first wins.
+        assert_eq!(next_frame_end(b"a\n\nb\r\n\r\n"), Some((1, 2)));
+    }
 
     #[test]
     fn delta_text_reads_content_and_ignores_the_rest() {

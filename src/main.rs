@@ -414,23 +414,21 @@ fn run_serve(config_path: &str, allow_remote: bool) -> ExitCode {
     // U-22: the counters and the session map are sibling Arcs, so a SIGHUP reload
     // rebuilds State around them instead of dropping every conversation's
     // affinity and every counter on the floor.
-    let stats = Arc::new(stats::Stats::new());
+    let live = http::Live::new(Arc::clone(&sessions));
     let state = Arc::new(http::State::new(
         cfg,
         environment,
         backends,
         auth_token,
         !loopback,
-        Arc::clone(&stats),
-        Arc::clone(&sessions),
+        &live,
     ));
     let holder: http::StateHolder = Arc::new(RwLock::new(state));
     install_reload_handler();
     spawn_reload_watcher(
         config_path.to_string(),
         Arc::clone(&holder),
-        stats,
-        sessions,
+        live,
         loopback,
         allow_remote,
     );
@@ -479,8 +477,7 @@ fn install_reload_handler() {
 fn spawn_reload_watcher(
     config_path: String,
     holder: http::StateHolder,
-    stats: Arc<stats::Stats>,
-    sessions: Arc<route::session::SessionStore>,
+    live: http::Live,
     loopback: bool,
     allow_remote: bool,
 ) {
@@ -491,14 +488,7 @@ fn spawn_reload_watcher(
                 continue;
             }
             log::info("SIGHUP: reloading config");
-            match reload_state(
-                &config_path,
-                &stats,
-                &sessions,
-                loopback,
-                allow_remote,
-                &holder,
-            ) {
+            match reload_state(&config_path, &live, loopback, allow_remote, &holder) {
                 Ok(msg) => log::info(&format!("SIGHUP: {msg}")),
                 Err(e) => log::error(&format!(
                     "SIGHUP: reload REJECTED, keeping the running config — {e}"
@@ -510,8 +500,7 @@ fn spawn_reload_watcher(
 
 fn reload_state(
     config_path: &str,
-    stats: &Arc<stats::Stats>,
-    sessions: &Arc<route::session::SessionStore>,
+    live: &http::Live,
     loopback: bool,
     allow_remote: bool,
     holder: &http::StateHolder,
@@ -574,15 +563,14 @@ fn reload_state(
         backends,
         auth_token,
         !loopback,
-        Arc::clone(stats),
-        Arc::clone(sessions),
+        live,
     ));
     match holder.write() {
         Ok(mut g) => *g = fresh,
         Err(e) => *e.into_inner() = fresh,
     }
     Ok(format!(
-        "swapped in {n_backends} backends and {n_chains} chains; counters and sessions preserved"
+        "swapped in {n_backends} backends and {n_chains} chains; counters, sessions, health and in-flight slots preserved"
     ))
 }
 

@@ -14,6 +14,7 @@
 
 use crate::backend::{Backend, DispatchResult};
 use crate::config::GateCfg;
+use crate::exec::chain::ActiveSlot;
 use crate::http::State;
 use crate::log;
 use crate::route::session::SessionKey;
@@ -108,6 +109,24 @@ impl Gate for JudgeGate {
                 ctx.reqid, self.classifier
             ));
             return Verdict::Accept;
+        };
+        // U-20: the judge is a backend like any other and must honor its cap.
+        // Without this it escapes `max_concurrent` entirely — and a gate fires on
+        // *every* accepted turn, so it is the single busiest caller in the tree.
+        // At capacity, decline to judge rather than queue: the gate fails open by
+        // design, and blocking here would stall a response that is already ready.
+        let _slot = match judge.max_concurrent() {
+            Some(max) => match ActiveSlot::try_acquire(&ctx.state.active, &self.classifier, max) {
+                Some(slot) => Some(slot),
+                None => {
+                    log::debug(&format!(
+                        "{} gate: judge '{}' at capacity; accepting",
+                        ctx.reqid, self.classifier
+                    ));
+                    return Verdict::Accept;
+                }
+            },
+            None => None,
         };
         let answer = tail(&result.content, self.window_chars);
         let prompt = match &self.prompt {

@@ -6,7 +6,8 @@
 use crate::backend::{Backend, BackendError};
 use crate::config::Config;
 use crate::env::Env;
-use crate::exec::chain::{self, BackendHealth, ChainCtx, StreamOutcome};
+pub use crate::exec::chain::BackendHealth;
+use crate::exec::chain::{self, ChainCtx, StreamOutcome};
 use crate::log;
 use crate::proto::{anthropic, openai};
 use crate::route::policy::{ClassifierPolicy, Policy, SignalPolicy, StaticPolicy};
@@ -15,7 +16,7 @@ use crate::route::{Decision, DecisionSource, RequestCtx};
 use crate::stats::Stats;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
-use std::io::{self, Read};
+use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -66,33 +67,60 @@ pub fn classify(method: &str, path: &str) -> Route {
     }
 }
 
-/// U-2: channel-backed SSE body. `read` blocks on the channel, so the coordinator
-/// thread can trickle `: keepalive` frames while dispatch runs, then push the
-/// final frames. EOF when the sender drops.
-pub struct ChannelSseBody {
-    rx: mpsc::Receiver<Vec<u8>>,
-    current: Vec<u8>,
-    pos: usize,
-}
-
-impl Read for ChannelSseBody {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            if self.pos < self.current.len() {
-                let n = (self.current.len() - self.pos).min(buf.len());
-                buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
-                self.pos += n;
-                return Ok(n);
-            }
-            match self.rx.recv() {
-                Ok(chunk) => {
-                    self.current = chunk;
-                    self.pos = 0;
-                }
-                Err(_) => return Ok(0),
-            }
+/// U-2 / §9.2: write the SSE response frame by frame, flushing each one.
+///
+/// This bypasses `tiny_http::Response` deliberately. Handing tiny_http a `Read`
+/// body makes it chunk through an 8 KiB buffer with no flush between writes, so
+/// every frame — keepalives included — sat in that buffer until the body ended:
+/// measured against a stub upstream emitting a token every 400 ms, all five
+/// frames arrived together at +1.63 s instead of at 0.0/0.4/0.8/1.2 s. Real
+/// token relay is the whole point of §9.2, and it does not survive a buffer.
+///
+/// Runs on the calling worker thread and returns when the sender drops, which is
+/// the same blocking shape `req.respond` had. Chunked framing is written by hand
+/// so the connection stays valid HTTP/1.1 without a Content-Length we cannot know.
+fn write_sse(req: Request, headers: Vec<(String, String)>, rx: mpsc::Receiver<Vec<u8>>) {
+    let mut head = String::from("HTTP/1.1 200 OK\r\n");
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    let mut w = req.into_writer();
+    if w.write_all(head.as_bytes()).is_err() || w.flush().is_err() {
+        return;
+    }
+    while let Ok(chunk) = rx.recv() {
+        if chunk.is_empty() {
+            continue;
+        }
+        let framed = format!("{:x}\r\n", chunk.len());
+        if w.write_all(framed.as_bytes()).is_err()
+            || w.write_all(&chunk).is_err()
+            || w.write_all(b"\r\n").is_err()
+            || w.flush().is_err()
+        {
+            // Client gone. The coordinator notices when its send fails.
+            return;
         }
     }
+    let _ = w.write_all(b"0\r\n\r\n");
+    let _ = w.flush();
+}
+
+/// U-10: the CORS headers as plain pairs, for the hand-written SSE response that
+/// cannot go through `apply_cors`.
+fn cors_header_pairs() -> Vec<(String, String)> {
+    CORS.with(|c| {
+        let s = c.borrow();
+        if !s.enabled {
+            return Vec::new();
+        }
+        let mut out = vec![("Vary".to_string(), "Origin".to_string())];
+        if let Some(o) = s.origin.as_deref() {
+            out.push(("Access-Control-Allow-Origin".to_string(), o.to_string()));
+        }
+        out
+    })
 }
 
 pub struct State {
@@ -104,10 +132,16 @@ pub struct State {
     pub auth_token: Option<String>,
     /// S-6: redact per-backend error detail (true when bound non-loopback).
     pub redact_errors: bool,
-    /// P-9 / U-13: per-backend health.
-    pub health: Mutex<HashMap<String, BackendHealth>>,
-    /// U-20: in-flight dispatch counts per backend.
-    pub active: Mutex<HashMap<String, usize>>,
+    /// P-9 / U-13: per-backend health. A **sibling `Arc`** for the same U-22
+    /// reason as `stats`: a reload that zeroed this would un-bench every cooling
+    /// backend, so editing an unrelated config key would send traffic straight
+    /// back at an upstream that is still failing.
+    pub health: Arc<Mutex<HashMap<String, BackendHealth>>>,
+    /// U-20: in-flight dispatch counts per backend. Also a sibling `Arc` —
+    /// requests already running hold the *old* `Arc<State>` and decrement its
+    /// map, so a fresh map on reload would double the effective cap for as long
+    /// as any of them are in flight.
+    pub active: Arc<Mutex<HashMap<String, usize>>>,
     /// §5.2 counters. A **sibling `Arc`, not a field of `Config`**, on purpose:
     /// U-22's SIGHUP reload swaps `Arc<State>`, and traffic history must survive
     /// the swap rather than resetting every time someone edits the config.
@@ -122,6 +156,34 @@ pub struct State {
     static_policy: StaticPolicy,
 }
 
+/// U-22: the runtime state that must **outlive** a config swap.
+///
+/// Everything here is deliberately not owned by the `Arc<State>` that SIGHUP
+/// replaces. Counters, session affinity, backend cooldowns, and in-flight slot
+/// accounting all describe the running *server*, not the config it started with,
+/// and a reload that dropped them would be a worse event than the edit that
+/// triggered it: every cooling backend un-benched, every conversation's affinity
+/// gone, and — for as long as the old requests are still in flight against the
+/// old map — twice the intended `max_concurrent`.
+#[derive(Clone)]
+pub struct Live {
+    pub stats: Arc<Stats>,
+    pub sessions: Arc<SessionStore>,
+    pub health: Arc<Mutex<HashMap<String, BackendHealth>>>,
+    pub active: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl Live {
+    pub fn new(sessions: Arc<SessionStore>) -> Live {
+        Live {
+            stats: Arc::new(Stats::new()),
+            sessions,
+            health: Arc::new(Mutex::new(HashMap::new())),
+            active: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
 impl State {
     pub fn new(
         cfg: Config,
@@ -129,8 +191,7 @@ impl State {
         backends: HashMap<String, Backend>,
         auth_token: Option<String>,
         redact_errors: bool,
-        stats: Arc<Stats>,
-        sessions: Arc<SessionStore>,
+        live: &Live,
     ) -> State {
         // §3.2: policy selection is a startup decision. `type = "signals"` builds
         // the quota-aware cascade; anything else is the §5 auto-router. Everything
@@ -158,8 +219,8 @@ impl State {
         // a number no longer in the config, which is exactly the kind of thing
         // nobody thinks to check.
         for (name, b) in &cfg.backends {
-            stats.set_limit_hint(name, b.quota_calls());
-            stats.set_quota_window(name, b.quota_window_secs());
+            live.stats.set_limit_hint(name, b.quota_calls());
+            live.stats.set_quota_window(name, b.quota_window_secs());
         }
         State {
             cfg,
@@ -167,10 +228,10 @@ impl State {
             backends,
             auth_token,
             redact_errors,
-            health: Mutex::new(HashMap::new()),
-            active: Mutex::new(HashMap::new()),
-            stats,
-            sessions,
+            health: Arc::clone(&live.health),
+            active: Arc::clone(&live.active),
+            stats: Arc::clone(&live.stats),
+            sessions: Arc::clone(&live.sessions),
             policies,
             static_policy: StaticPolicy,
         }
@@ -205,8 +266,7 @@ impl State {
             HashMap::new(),
             None,
             false,
-            Arc::new(Stats::new()),
-            sessions,
+            &Live::new(sessions),
         )
     }
 }
@@ -1115,30 +1175,27 @@ fn stream_with_keepalive(
         }
     });
     let mut headers = vec![
-        header("Content-Type", "text/event-stream"),
-        header("Cache-Control", "no-cache"),
+        ("Content-Type".to_string(), "text/event-stream".to_string()),
+        ("Cache-Control".to_string(), "no-cache".to_string()),
+        // Tell a reverse proxy not to do to us what tiny_http was doing: nginx
+        // buffers proxied responses by default and would re-introduce exactly the
+        // latency this path exists to remove.
+        ("X-Accel-Buffering".to_string(), "no".to_string()),
     ];
     // §5.1: the streaming path can emit provenance for the *decision* but not for
     // the winner — these headers are written before the chain runs, and naming a
     // leg that might yet fall through would be a lie. `x-tmuxlet-backend` is
     // therefore non-streaming only; the winner is in the closing log line.
-    headers.push(header("x-tmuxlet-route", &route_header));
-    headers.push(header("x-tmuxlet-decision", decision.source.as_str()));
+    headers.push(("x-tmuxlet-route".to_string(), route_header));
+    headers.push((
+        "x-tmuxlet-decision".to_string(),
+        decision.source.as_str().to_string(),
+    ));
     if let Some(r) = decision.rationale_header(redact) {
-        headers.push(header("x-tmuxlet-rationale", &r));
+        headers.push(("x-tmuxlet-rationale".to_string(), r));
     }
-    let resp = Response::new(
-        StatusCode(200),
-        headers,
-        ChannelSseBody {
-            rx,
-            current: Vec::new(),
-            pos: 0,
-        },
-        None,
-        None,
-    );
-    let _ = req.respond(apply_cors(resp));
+    headers.extend(cors_header_pairs());
+    write_sse(req, headers, rx);
 }
 
 /// U-23's compact summary, on its own so the Anthropic envelope can carry the
@@ -1323,22 +1380,6 @@ mod tests {
             classify("POST", "/metrics"),
             Route::MethodNotAllowed("GET, HEAD")
         ));
-    }
-
-    #[test]
-    fn channel_sse_body_streams_then_eof_on_drop() {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        tx.send(b": keepalive\n\n".to_vec()).unwrap();
-        tx.send(b"data: x\n\n".to_vec()).unwrap();
-        drop(tx); // sender drop -> EOF
-        let mut body = ChannelSseBody {
-            rx,
-            current: Vec::new(),
-            pos: 0,
-        };
-        let mut s = String::new();
-        std::io::Read::read_to_string(&mut body, &mut s).unwrap();
-        assert_eq!(s, ": keepalive\n\ndata: x\n\n");
     }
 
     #[test]

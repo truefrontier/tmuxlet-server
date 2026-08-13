@@ -227,7 +227,19 @@ fn run_inner(
             log::debug(&format!("{reqid} skip backend={name}: session overflow"));
             continue;
         }
-        let backend = &state.backends[name];
+        // NOT `state.backends[name]`. The session store survives a U-22 reload,
+        // so a replayed affinity decision can name a backend the new config no
+        // longer defines — and an index panic there answers a bodyless 500.
+        let Some(backend) = state.backends.get(name) else {
+            errors.push(BackendError::Backend(
+                name.to_string(),
+                "no longer a defined backend (config reloaded?)".into(),
+            ));
+            log::warn(&format!(
+                "{reqid} skip backend={name}: not in the current config"
+            ));
+            continue;
+        };
         // U-20: reserve a concurrency slot (RAII: released on Drop, even on a
         // dispatch panic). At the cap this leg is Busy and the chain advances.
         let _slot = match backend.max_concurrent() {
@@ -296,6 +308,19 @@ fn run_inner(
                 if let Verdict::Reject(why) = verdict {
                     let e = BackendError::Backend(name.to_string(), why.clone());
                     record_failure(state, name, &e, elapsed_ms);
+                    // §9.2 again: the guard belongs on every path out of a
+                    // committed leg, not just the error one. A judge cannot reach
+                    // here (gates disable streaming), but NonEmptyGate can — a
+                    // whitespace-only relayed token commits the response and then
+                    // trims to empty. Advancing would dispatch another backend
+                    // whose answer could never be written.
+                    if committed {
+                        log::error(&format!(
+                            "{reqid} backend={name} rejected after committing the stream: {why}"
+                        ));
+                        errors.push(e);
+                        return Err(errors);
+                    }
                     log::warn(&format!("{reqid} skip backend={name}: {why}"));
                     errors.push(e);
                     continue;
@@ -580,6 +605,47 @@ bin = "/bin/echo"
         let e = h.get("echo").unwrap();
         assert_eq!(e.consecutive_failures, 1, "a real failure still counts");
         assert!(e.cooling_until.is_some(), "a real failure still cools");
+    }
+
+    #[test]
+    fn a_leg_naming_a_backend_that_no_longer_exists_does_not_panic() {
+        // U-22 + §6.3: the session store survives a config reload, so a replayed
+        // affinity decision can name a backend the new config dropped. Indexing
+        // the map there panicked the worker, and tiny_http answers a handler
+        // panic with a bodyless 500 — the least debuggable failure the server can
+        // produce. `State::for_test` has no backends at all, which is exactly the
+        // post-reload shape.
+        const C: &str = r#"
+[server]
+listen = "127.0.0.1:3456"
+default_chain = "gone"
+env_source = "process"
+
+[backends.gone]
+type = "cli"
+bin = "/bin/echo"
+"#;
+        let state = State::for_test(crate::config::parse(C).unwrap());
+        let errs = run(
+            &state,
+            &ChainCtx {
+                legs: &["gone"],
+                prompt: "p",
+                last_user: "p",
+                raw: &serde_json::Value::Null,
+                default_to: Duration::from_secs(1),
+                reqid: "test",
+                session: None,
+                gate: None,
+            },
+        )
+        .expect_err("a chain of undefined backends cannot succeed");
+        assert_eq!(errs.len(), 1);
+        assert!(
+            errs[0].to_string().contains("no longer a defined backend"),
+            "the error must say what happened: {}",
+            errs[0]
+        );
     }
 
     #[test]

@@ -345,12 +345,28 @@ fn stream_body<R: Read>(
             }
             continue;
         }
-        let out = if chunked {
+        let (out, end_of_body) = if chunked {
             take_chunks(&mut pending)
         } else {
-            std::mem::take(&mut pending)
+            (std::mem::take(&mut pending), false)
         };
+        // S-5: `pending` holds an in-progress chunk, so an upstream that never
+        // completes one would grow it without bound even though the *decoded*
+        // total is still under the cap. Bound the buffer itself.
+        if max_bytes > 0 && pending.len() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "incomplete chunk exceeds the cap",
+            ));
+        }
         if out.is_empty() {
+            // F-5's sibling for the streaming path: stop at the terminating zero
+            // chunk rather than waiting for a close. An upstream that ignores our
+            // `Connection: close` would otherwise stall us until the read timeout
+            // and turn a completed answer into a false failure.
+            if end_of_body {
+                break;
+            }
             continue;
         }
         relayed = relayed.saturating_add(out.len());
@@ -361,6 +377,9 @@ fn stream_body<R: Read>(
             ));
         }
         if !on_chunk(&out) {
+            break;
+        }
+        if end_of_body {
             break;
         }
     }
@@ -377,9 +396,11 @@ fn stream_body<R: Read>(
 
 /// Pull every COMPLETE chunk out of `data`, leaving any partial tail behind for
 /// the next read. Returns the decoded bytes.
-fn take_chunks(data: &mut Vec<u8>) -> Vec<u8> {
+/// Returns the decoded bytes and whether the terminating zero chunk was seen.
+fn take_chunks(data: &mut Vec<u8>) -> (Vec<u8>, bool) {
     let mut out = Vec::new();
     let mut consumed = 0usize;
+    let mut done = false;
     loop {
         let rest = &data[consumed..];
         let Some(nl) = rest.windows(2).position(|w| w == b"\r\n") else {
@@ -399,11 +420,12 @@ fn take_chunks(data: &mut Vec<u8>) -> Vec<u8> {
         out.extend_from_slice(&rest[start..start + size]);
         consumed += start + size + 2;
         if size == 0 {
+            done = true;
             break;
         }
     }
     data.drain(..consumed);
-    out
+    (out, done)
 }
 
 #[allow(clippy::too_many_arguments)]
