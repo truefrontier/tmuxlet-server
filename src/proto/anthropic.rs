@@ -281,6 +281,9 @@ mod tests {
         match &m.content {
             MessageContent::Text(s) => s.as_str(),
             MessageContent::Parts(_) => panic!("translation must produce flat text"),
+            // Translation always emits `Text`; a `Null` here would mean the
+            // Anthropic side started passing content through untouched.
+            MessageContent::Null => panic!("translation must produce text, not null"),
         }
     }
 

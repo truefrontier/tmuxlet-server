@@ -20,6 +20,9 @@ pub struct ChatRequest {
 #[derive(Debug, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
+    /// Defaulted, because an assistant message that carries only `tool_calls`
+    /// omits it entirely. See `MessageContent::Null`.
+    #[serde(default)]
     pub content: MessageContent,
     // OpenAI per-message `name`; parsed for request-shape completeness but not
     // used when flattening messages to a single prompt.
@@ -28,11 +31,20 @@ pub struct ChatMessage {
     pub name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+    /// `"content": null`, or absent.
+    ///
+    /// This is what a real OpenAI client sends on an assistant message that
+    /// carries only `tool_calls`. Without an arm for it, untagged deserialization
+    /// matches neither `Text` nor `Parts` and the whole request 400s **before
+    /// routing runs** — which would reject exactly the tool-history traffic §7's
+    /// signal router exists to read.
+    #[default]
+    Null,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,6 +58,7 @@ pub enum ContentPart {
 
 fn content_to_text(c: &MessageContent) -> String {
     match c {
+        MessageContent::Null => String::new(),
         MessageContent::Text(s) => s.clone(),
         MessageContent::Parts(ps) => {
             // U-15: join text parts with `\n` (not `""`, which glues words), and
@@ -432,6 +445,29 @@ impl ErrorEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_calls_assistant_message_parses() {
+        // A real OpenAI agent client sends `"content": null` (or omits it) on an
+        // assistant message that carries only tool_calls. This used to 400 before
+        // routing ever ran, which meant the §7 signal router could never see the
+        // one kind of traffic it exists to read.
+        let req: ChatRequest = serde_json::from_str(
+            r#"{"model":"m","messages":[
+                {"role":"user","content":"go"},
+                {"role":"assistant","content":null,"tool_calls":[{"id":"1","type":"function","function":{"name":"Read","arguments":"{}"}}]},
+                {"role":"assistant","tool_calls":[{"id":"2","type":"function","function":{"name":"Write","arguments":"{}"}}]},
+                {"role":"tool","tool_call_id":"1","content":"ok"}
+            ]}"#,
+        )
+        .expect("a real agent transcript must parse");
+        assert_eq!(req.messages.len(), 4);
+        // A content-less assistant turn flattens to an empty string, not to the
+        // literal "null".
+        assert_eq!(content_to_text(&req.messages[1].content), "");
+        assert_eq!(content_to_text(&req.messages[2].content), "");
+        assert_eq!(last_user_text(&req.messages), "go");
+    }
 
     #[test]
     fn parses_string_and_array_content() {

@@ -705,3 +705,47 @@ fn validate(cfg: &std::path::Path) -> std::process::Output {
         .output()
         .expect("spawn tmuxlet-server --validate")
 }
+
+/// A session must NOT freeze a signals decision.
+///
+/// §7.7 lists affinity as rung 1, and a classifier router takes that literally —
+/// there the cached decision depends on nothing that changes between turns. For a
+/// signals router it would be a bug: rungs 2-6 are functions of *live quota
+/// pressure*. Caching one means a session that started with headroom keeps
+/// spending leg 0 long after the quota is gone, which defeats the entire
+/// mechanism the phase exists for.
+#[test]
+fn a_session_does_not_freeze_a_pressure_dependent_decision() {
+    let port = common::free_port();
+    let cfg = two_leg(port, "quota_calls = 2", "", "");
+    let server = common::start(&cfg);
+    let url = format!("{}/v1/chat/completions", server.base);
+    let body = r#"{"model":"auto","messages":[{"role":"user","content":"hi"}]}"#;
+
+    let mut decisions = Vec::new();
+    for _ in 0..4 {
+        let (status, headers, b) = common::send_body(
+            "POST",
+            &url,
+            &[("x-tmuxlet-session-id", "frozen-if-broken")],
+            body,
+        );
+        assert_eq!(status, 200, "body: {b}");
+        decisions.push(
+            headers
+                .get("x-tmuxlet-decision")
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+    // Two turns of headroom, then the wall — within ONE session.
+    assert_eq!(
+        decisions,
+        vec!["static", "static", "quota", "quota"],
+        "the cascade must re-run every turn, not replay turn 1"
+    );
+    assert!(
+        !decisions.contains(&"affinity".to_string()),
+        "a signals router must not replay a pressure-dependent decision: {decisions:?}"
+    );
+}

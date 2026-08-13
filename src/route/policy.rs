@@ -180,23 +180,19 @@ impl Policy for SignalPolicy {
         let Some(r) = ctx.cfg.routers.get(&self.router) else {
             return Err(router_error(format!("router '{}' is gone", self.router)));
         };
-        // Rung 1: session affinity.
-        if r.session_affinity
-            && let Some(key) = ctx.session
-            && let Some(prev) = state.sessions.get(key).and_then(|st| st.decision)
-        {
-            return Ok(Decision {
-                legs: prev.legs,
-                source: DecisionSource::Affinity,
-                rationale: format!(
-                    "session affinity: reusing this conversation's {} decision",
-                    prev.source.as_str()
-                ),
-                label: prev.label,
-                chain: prev.chain,
-            });
-        }
-
+        // NOTE ON RUNG 1. §7.7 lists session affinity first, and a classifier
+        // router takes it literally — there, affinity's whole job is to skip an
+        // LLM round-trip, and the decision it replays does not depend on
+        // anything that changes between turns.
+        //
+        // A signals router is different, and replaying a whole decision here
+        // would be a bug: rungs 2 through 6 are functions of *live quota
+        // pressure* and *this turn's* tool signals. Caching one would mean a
+        // session that hit the wall once stays shed forever after the window
+        // resets and — worse — a session that started with headroom keeps
+        // spending leg 0 long after the quota is gone, defeating the whole
+        // mechanism. Affinity therefore applies to exactly the rung with a
+        // round-trip to save: the classifier consultation at rung 7.
         let chain_name = r.chain.as_deref().unwrap_or(&ctx.cfg.server.default_chain);
         let legs: Vec<String> = resolve::resolve(chain_name, ctx.cfg)
             .map_err(router_error)?
@@ -227,7 +223,6 @@ impl Policy for SignalPolicy {
                 label: label.clone(),
                 chain: gate_chain.clone(),
             };
-            store_affinity(state, ctx, r, &d);
             Ok(d)
         };
 
@@ -316,17 +311,43 @@ impl Policy for SignalPolicy {
         }
 
         // Rung 7: sub-threshold, so ask the classifier if one is configured.
+        //
+        // This is the one rung whose answer does NOT move with quota pressure, so
+        // it is the one rung affinity applies to: replaying it skips the
+        // round-trip §7 exists to avoid, while rungs 2-6 stay live above it.
         if r.classifier.is_some() {
+            if r.session_affinity
+                && let Some(key) = ctx.session
+                && let Some(prev) = state
+                    .sessions
+                    .get(key)
+                    .and_then(|st| st.decision)
+                    .filter(|d| d.source == DecisionSource::Classifier)
+            {
+                return Ok(Decision {
+                    legs: prev.legs,
+                    source: DecisionSource::Affinity,
+                    rationale: "session affinity: reusing this conversation's class".to_string(),
+                    label: prev.label,
+                    chain: prev.chain,
+                });
+            }
             let (class, source, ms) = classify_task(state, r, ctx.messages);
             if source == DecisionSource::Classifier
                 && let Some(target) = r.routes.get(&class).cloned()
                 && let Ok(names) = resolve::resolve(&target, ctx.cfg)
             {
-                return finish(
-                    names.iter().map(|s| s.to_string()).collect(),
-                    DecisionSource::Classifier,
-                    format!("score was indecisive; classifier chose '{class}' in {ms}ms"),
-                );
+                let d = Decision {
+                    legs: names.iter().map(|s| s.to_string()).collect(),
+                    source: DecisionSource::Classifier,
+                    rationale: format!(
+                        "score was indecisive; classifier chose '{class}' in {ms}ms"
+                    ),
+                    label: Some(format!("{class}/{target}")),
+                    chain: ctx.cfg.chains.contains_key(&target).then_some(target),
+                };
+                store_affinity(state, ctx, r, &d);
+                return Ok(d);
             }
         }
 
