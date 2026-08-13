@@ -11,7 +11,9 @@
 
 pub mod policy;
 pub mod resolve;
+pub mod scorer;
 pub mod session;
+pub mod signals;
 
 use crate::config::Config;
 use crate::proto::openai::ChatMessage;
@@ -24,6 +26,10 @@ use session::SessionKey;
 pub struct RequestCtx<'a> {
     pub model: &'a str,
     pub messages: &'a [ChatMessage],
+    /// The verbatim request JSON. §7.1's signal extraction reads `tool_calls` and
+    /// `role:"tool"` results out of it — fields the typed `ChatMessage` view
+    /// deliberately drops.
+    pub raw: &'a serde_json::Value,
     pub cfg: &'a Config,
     /// B3/U-8: the request id, so a policy's own log lines correlate with the
     /// closing summary line the transport emits.
@@ -44,6 +50,10 @@ pub struct Decision {
     pub rationale: String,
     /// `class/target` for routers; `None` for a direct chain or backend.
     pub label: Option<String>,
+    /// §8: the chain these legs came from, so the transport can find its gate.
+    /// `None` when the model named a single backend — a one-leg chain has nowhere
+    /// to escalate to anyway.
+    pub chain: Option<String>,
 }
 
 /// The longest `x-tmuxlet-rationale` we will emit. A header is not a log line,
@@ -95,6 +105,19 @@ impl Decision {
         })
     }
 
+    /// The same header without a winner, for the streaming path: SSE headers are
+    /// written before the chain runs, and naming a leg that might yet fall
+    /// through would be a lie. Shares `route_part`, so the client-supplied
+    /// `model` is bounded here too — an 80 KB model name otherwise produced an
+    /// 80 KB response header that nginx turns into a 502.
+    pub fn route_header_prefix(&self, model: &str) -> String {
+        let model = route_part(model);
+        header_safe(&match &self.label {
+            Some(l) => format!("{model}/{}", route_part(l)),
+            None => model,
+        })
+    }
+
     /// `x-tmuxlet-rationale`, bounded and control-stripped.
     ///
     /// Returns `None` when `redact` is set (S-6, bound non-loopback): the
@@ -117,9 +140,9 @@ impl Decision {
 /// comparable when both are deployed — with `Static`/`Default` added, because our
 /// model string can name a chain directly and theirs cannot.
 ///
-/// Variants land as the phases that construct them land: CI runs
+/// Every variant is constructed somewhere: CI runs
 /// `clippy --all-targets -- -D warnings`, and a variant nothing constructs is a
-/// hard failure. Phase 3 adds `Quota`, `Override`, `Settled`, and `Dimensions`.
+/// hard failure.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DecisionSource {
     /// The model named a chain or a backend.
@@ -129,6 +152,17 @@ pub enum DecisionSource {
     /// §6.3: reused this session's earlier decision, skipping the classifier
     /// entirely. That skip is the cost win affinity exists for.
     Affinity,
+    /// §7.7 rung 2: leg 0 is past its quota wall (429 / `Retry-After`). Skipped,
+    /// **not cooled** — the backend is healthy, it is just out of headroom.
+    Quota,
+    /// §7.7 rung 3: a critical tool error or a compacted context forced the
+    /// flat-rate leg, regardless of pressure.
+    Override,
+    /// §7.7 rung 5: tests passed and work was produced, so the run is settled
+    /// enough to shed a leg while rationing.
+    Settled,
+    /// §7.7 rung 6: the scorer crossed `confidence_threshold` while rationing.
+    Dimensions,
     /// The classifier returned a usable class.
     Classifier,
     /// We tried to be smart and could not: the classifier was missing, at its
@@ -154,6 +188,10 @@ impl DecisionSource {
         DecisionSource::Static,
         DecisionSource::Default,
         DecisionSource::Affinity,
+        DecisionSource::Quota,
+        DecisionSource::Override,
+        DecisionSource::Settled,
+        DecisionSource::Dimensions,
         DecisionSource::Classifier,
         DecisionSource::FallOpen,
     ];
@@ -166,6 +204,10 @@ impl DecisionSource {
             DecisionSource::Static => "static",
             DecisionSource::Default => "default",
             DecisionSource::Affinity => "affinity",
+            DecisionSource::Quota => "quota",
+            DecisionSource::Override => "override",
+            DecisionSource::Settled => "settled",
+            DecisionSource::Dimensions => "dimensions",
             DecisionSource::Classifier => "classifier",
             DecisionSource::FallOpen => "fall_open",
         }
@@ -196,6 +238,7 @@ mod tests {
             source: DecisionSource::Static,
             rationale: rationale.to_string(),
             label: label.map(str::to_string),
+            chain: None,
         }
     }
 
@@ -261,6 +304,22 @@ mod tests {
     }
 
     #[test]
+    fn the_streaming_route_header_is_bounded_too() {
+        // The streaming path used to inline its own format!, so the cap added to
+        // route_header did not apply to it — an 80 KB model produced an 80 KB SSE
+        // response header, written before the chain even ran.
+        let d = decision(Some("code/do-code"), "");
+        let h = d.route_header_prefix(&"m".repeat(80_000));
+        assert!(
+            h.chars().count() <= 2 * (ROUTE_PART_MAX + 1),
+            "unbounded: {}",
+            h.len()
+        );
+        assert!(h.ends_with("/code/do-code"), "the label must survive: {h}");
+        assert_eq!(decision(None, "").route_header_prefix("plain"), "plain");
+    }
+
+    #[test]
     fn a_non_ascii_rationale_cannot_panic_the_worker() {
         // tiny_http rejects a non-ISO-8859-1 header value and `header()` expects
         // on it, so an arrow in a rationale used to answer a bare bodyless 500.
@@ -280,6 +339,10 @@ mod tests {
         assert_eq!(DecisionSource::Static.as_str(), "static");
         assert_eq!(DecisionSource::Default.as_str(), "default");
         assert_eq!(DecisionSource::Affinity.as_str(), "affinity");
+        assert_eq!(DecisionSource::Quota.as_str(), "quota");
+        assert_eq!(DecisionSource::Override.as_str(), "override");
+        assert_eq!(DecisionSource::Settled.as_str(), "settled");
+        assert_eq!(DecisionSource::Dimensions.as_str(), "dimensions");
         assert_eq!(DecisionSource::Classifier.as_str(), "classifier");
         assert_eq!(DecisionSource::FallOpen.as_str(), "fall_open");
         // ALL must stay exhaustive: a variant missing from it is a Prometheus
@@ -289,11 +352,15 @@ mod tests {
             DecisionSource::Static,
             DecisionSource::Default,
             DecisionSource::Affinity,
+            DecisionSource::Quota,
+            DecisionSource::Override,
+            DecisionSource::Settled,
+            DecisionSource::Dimensions,
             DecisionSource::Classifier,
             DecisionSource::FallOpen,
         ] {
             assert!(labels.contains(&d.as_str()), "{d:?} missing from ALL");
         }
-        assert_eq!(labels.len(), 5, "a new variant needs an ALL entry");
+        assert_eq!(labels.len(), 9, "a new variant needs an ALL entry");
     }
 }

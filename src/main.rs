@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::ExitCode;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tiny_http::Server;
 
@@ -31,6 +32,10 @@ struct Args {
     validate: bool,
     check_backends: bool,
     allow_remote: bool,
+    /// §10: print the resolved policy and leg order for a model, then exit.
+    explain: Option<String>,
+    /// §12: score a JSONL corpus offline and sweep confidence_threshold.
+    replay: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -40,6 +45,8 @@ fn main() -> ExitCode {
         validate: false,
         check_backends: false,
         allow_remote: false,
+        explain: None,
+        replay: None,
     };
     let mut i = 0;
     while i < argv.len() {
@@ -67,9 +74,33 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            "--explain" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(m) => args.explain = Some(m.clone()),
+                    None => {
+                        eprintln!("tmuxlet-server: --explain requires a model id");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            "--replay" => {
+                i += 1;
+                match argv.get(i) {
+                    Some(f) => args.replay = Some(f.clone()),
+                    None => {
+                        eprintln!("tmuxlet-server: --replay requires a .jsonl path");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             other => {
                 if let Some(p) = other.strip_prefix("--config=") {
                     args.config = p.to_string();
+                } else if let Some(m) = other.strip_prefix("--explain=") {
+                    args.explain = Some(m.to_string());
+                } else if let Some(f) = other.strip_prefix("--replay=") {
+                    args.replay = Some(f.to_string());
                 } else {
                     eprintln!("tmuxlet-server: unknown argument: {other}");
                     return ExitCode::FAILURE;
@@ -79,6 +110,12 @@ fn main() -> ExitCode {
         i += 1;
     }
 
+    if let Some(file) = &args.replay {
+        return run_replay(file);
+    }
+    if let Some(model) = &args.explain {
+        return run_explain(&args.config, model);
+    }
     if args.validate || args.check_backends {
         return run_validate(&args);
     }
@@ -374,24 +411,361 @@ fn run_serve(config_path: &str, allow_remote: bool) -> ExitCode {
         cfg.server.session_max,
         cfg.server.session_ttl_secs,
     ));
+    // U-22: the counters and the session map are sibling Arcs, so a SIGHUP reload
+    // rebuilds State around them instead of dropping every conversation's
+    // affinity and every counter on the floor.
+    let stats = Arc::new(stats::Stats::new());
     let state = Arc::new(http::State::new(
         cfg,
         environment,
         backends,
         auth_token,
         !loopback,
-        // U-22: the counters and the session map are built here and handed in as
-        // sibling Arcs, so a future SIGHUP reload can rebuild State around them
-        // instead of dropping every conversation's affinity on the floor.
-        Arc::new(stats::Stats::new()),
-        sessions,
+        Arc::clone(&stats),
+        Arc::clone(&sessions),
     ));
-    http::serve(server, state, workers);
+    let holder: http::StateHolder = Arc::new(RwLock::new(state));
+    install_reload_handler();
+    spawn_reload_watcher(
+        config_path.to_string(),
+        Arc::clone(&holder),
+        stats,
+        sessions,
+        loopback,
+        allow_remote,
+    );
+    http::serve(server, holder, workers);
     ExitCode::SUCCESS
+}
+
+/// U-22: set by the SIGHUP handler, drained by the watcher thread.
+///
+/// A signal handler may only do async-signal-safe work, so it does exactly one
+/// thing: store a flag. Everything real — file I/O, validation, allocation —
+/// happens on an ordinary thread.
+static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_sighup(_: CInt) {
+    RELOAD_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// `libc::c_int` without depending on `libc` directly — `nix` re-exports it.
+type CInt = nix::libc::c_int;
+
+fn install_reload_handler() {
+    // SAFETY: `on_sighup` only stores to an AtomicBool, which is
+    // async-signal-safe. SIGHUP's default action is to terminate, so failing to
+    // install this would make `kill -HUP` kill the server — warn loudly.
+    let res = unsafe {
+        nix::sys::signal::signal(
+            nix::sys::signal::Signal::SIGHUP,
+            nix::sys::signal::SigHandler::Handler(on_sighup),
+        )
+    };
+    if let Err(e) = res {
+        log::warn(&format!(
+            "could not install the SIGHUP handler ({e}); config reload is unavailable and kill -HUP will terminate the server"
+        ));
+    }
+}
+
+/// U-22: re-load, validate, and swap `Arc<State>`.
+///
+/// **A bad config must never brick a running service** (UX invariant 2): a reload
+/// that fails to parse or validate is logged and discarded, and the old state
+/// keeps serving. `listen` and `workers` are load-bearing at startup only — the
+/// socket is already bound and the threads already spawned — so a change to
+/// either is reported and ignored rather than silently having no effect.
+fn spawn_reload_watcher(
+    config_path: String,
+    holder: http::StateHolder,
+    stats: Arc<stats::Stats>,
+    sessions: Arc<route::session::SessionStore>,
+    loopback: bool,
+    allow_remote: bool,
+) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if !RELOAD_REQUESTED.swap(false, Ordering::Relaxed) {
+                continue;
+            }
+            log::info("SIGHUP: reloading config");
+            match reload_state(
+                &config_path,
+                &stats,
+                &sessions,
+                loopback,
+                allow_remote,
+                &holder,
+            ) {
+                Ok(msg) => log::info(&format!("SIGHUP: {msg}")),
+                Err(e) => log::error(&format!(
+                    "SIGHUP: reload REJECTED, keeping the running config — {e}"
+                )),
+            }
+        }
+    });
+}
+
+fn reload_state(
+    config_path: &str,
+    stats: &Arc<stats::Stats>,
+    sessions: &Arc<route::session::SessionStore>,
+    loopback: bool,
+    allow_remote: bool,
+    holder: &http::StateHolder,
+) -> Result<String, String> {
+    let path = config::tilde_path(config_path);
+    let (cfg, warnings) = config::load(&path)?;
+    for w in &warnings {
+        log::warn(&format!("SIGHUP: {w}"));
+    }
+    // S-2 still applies on reload: a config that turns auth off while bound to a
+    // public address must not be allowed to take effect.
+    let auth_token = auth::resolve(
+        cfg.server.auth,
+        cfg.server.auth_token_env.as_deref(),
+        &capture_env(&cfg),
+        &config::tilde_path("~/.tmuxlet/token"),
+    )?;
+    bind_policy(&cfg.server.listen, auth_token.is_some(), allow_remote)?;
+
+    let old = holder
+        .read()
+        .map(|g| Arc::clone(&g))
+        .map_err(|_| "state lock is poisoned".to_string())?;
+    if cfg.server.listen != old.cfg.server.listen {
+        log::warn(&format!(
+            "SIGHUP: listen changed to {} but the socket is already bound to {}; restart to move it",
+            cfg.server.listen, old.cfg.server.listen
+        ));
+    }
+    if cfg.server.workers != old.cfg.server.workers {
+        log::warn("SIGHUP: workers changed but the pool is already spawned; restart to resize it");
+    }
+    log::set_level(&cfg.server.log_level);
+
+    let environment = capture_env(&cfg);
+    let has_tmuxlet = cfg
+        .backends
+        .values()
+        .any(|b| matches!(b, config::Backend::Tmuxlet { .. }));
+    let defaults = backend::ServerDefaults {
+        max_response_bytes: cfg.server.max_response_bytes,
+        env_pass: cfg.server.env_pass.clone(),
+        tmuxlet_stdin: has_tmuxlet && probe_tmuxlet_stdin(&environment),
+    };
+    let backends: HashMap<String, Backend> = cfg
+        .backends
+        .iter()
+        .map(|(name, b)| {
+            (
+                name.clone(),
+                Backend::from_config(name, b, &environment, &defaults),
+            )
+        })
+        .collect();
+    let n_backends = backends.len();
+    let n_chains = cfg.chains.len();
+    let fresh = Arc::new(http::State::new(
+        cfg,
+        environment,
+        backends,
+        auth_token,
+        !loopback,
+        Arc::clone(stats),
+        Arc::clone(sessions),
+    ));
+    match holder.write() {
+        Ok(mut g) => *g = fresh,
+        Err(e) => *e.into_inner() = fresh,
+    }
+    Ok(format!(
+        "swapped in {n_backends} backends and {n_chains} chains; counters and sessions preserved"
+    ))
 }
 
 fn print_help() {
     println!(
-        "tmuxlet-server {VERSION}\n\nUsage:\n  tmuxlet-server [--config FILE]    Start the server (default config: {DEFAULT_CONFIG})\n  tmuxlet-server --validate         Validate config (strict) and exit\n  tmuxlet-server --dry-run          Alias for --validate\n  tmuxlet-server --check-backends   Probe each backend's reachability and exit\n  tmuxlet-server --version          Print version\n  tmuxlet-server --help             Print this help\n\nConfig is TOML at {DEFAULT_CONFIG} (override with --config FILE or --config=FILE).\nA fresh config listens on {DEFAULT_LISTEN}. Set `auth = true` for a bearer token\n(written to ~/.tmuxlet/token); --allow-remote-unauthenticated permits a\nnon-loopback bind without auth."
+        "tmuxlet-server {VERSION}\n\nUsage:\n  tmuxlet-server [--config FILE]    Start the server (default config: {DEFAULT_CONFIG})\n  tmuxlet-server --validate         Validate config (strict) and exit\n  tmuxlet-server --dry-run          Alias for --validate\n  tmuxlet-server --explain MODEL    Print the policy, cascade and leg order for a model\n  tmuxlet-server --replay FILE      Score a JSONL conversation corpus offline (§12)\n  tmuxlet-server --check-backends   Probe each backend's reachability and exit\n  tmuxlet-server --version          Print version\n  tmuxlet-server --help             Print this help\n\nConfig is TOML at {DEFAULT_CONFIG} (override with --config FILE or --config=FILE).\nA fresh config listens on {DEFAULT_LISTEN}. Set `auth = true` for a bearer token\n(written to ~/.tmuxlet/token); --allow-remote-unauthenticated permits a\nnon-loopback bind without auth."
     );
+}
+
+/// §10 `--explain <model>`: print the resolved policy, the cascade it will walk,
+/// and the leg order, without starting the server.
+///
+/// This is the debugging tool the config format has needed since the five-router
+/// framework landed: "which backend will `do` actually hit, and why" was
+/// previously only answerable by sending a request and reading a header.
+fn run_explain(config_path: &str, model: &str) -> ExitCode {
+    let path = config::tilde_path(config_path);
+    let (cfg, _warnings) = match config::load(&path) {
+        Ok(cw) => cw,
+        Err(e) => {
+            eprintln!("tmuxlet-server: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("model: {model}");
+    match cfg.routers.get(model) {
+        Some(r) if r.kind == "signals" => {
+            let chain = r.chain.as_deref().unwrap_or(&cfg.server.default_chain);
+            println!("policy: signals (§7)");
+            println!(
+                "  confidence_threshold={} reserve_threshold={} recent_turn_window={}",
+                r.confidence_threshold, r.reserve_threshold, r.recent_turn_window
+            );
+            println!("  chain: {chain}");
+            print_legs(&cfg, chain, "    ");
+            println!("cascade (§7.7), first match wins:");
+            println!("  1 affinity   session hit reuses the earlier decision");
+            println!("  2 quota      leg 0 pressure == 1.0 -> start one leg deeper");
+            println!("  3 override   compacted context or a critical tool error -> leg 0");
+            println!(
+                "  4 static     pressure < {} -> leg 0  [the common path]",
+                r.reserve_threshold
+            );
+            println!("  5 settled    rationing + tests passed -> shed one leg");
+            println!(
+                "  6 dimensions rationing + confidence >= {} -> score decides",
+                r.confidence_threshold
+            );
+            match &r.classifier {
+                Some(c) => println!("  7 classifier rationing + sub-threshold -> ask '{c}'"),
+                None => println!("  7 classifier (no classifier configured; skipped)"),
+            }
+            println!("  8 fall_open  shed one leg, subject to the agentic constraint");
+        }
+        Some(r) => {
+            println!("policy: classifier (§5)");
+            println!(
+                "  classifier={} fallback_class={}",
+                r.classifier.as_deref().unwrap_or("-"),
+                r.fallback_class.as_deref().unwrap_or("-")
+            );
+            let mut classes: Vec<(&String, &String)> = r.routes.iter().collect();
+            classes.sort();
+            for (class, target) in classes {
+                println!("  class '{class}' -> {target}");
+                print_legs(&cfg, target, "    ");
+            }
+        }
+        None => {
+            let known = cfg.chains.contains_key(model) || cfg.backends.contains_key(model);
+            if known {
+                println!("policy: static — the model names a chain or backend");
+            } else if cfg.server.strict_models {
+                println!(
+                    "policy: static — UNKNOWN model, and strict_models = true, so this is a 404"
+                );
+                return ExitCode::FAILURE;
+            } else {
+                println!(
+                    "policy: default — unknown model falls back to default_chain '{}'",
+                    cfg.server.default_chain
+                );
+            }
+            let target = if known {
+                model
+            } else {
+                &cfg.server.default_chain
+            };
+            print_legs(&cfg, target, "  ");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Print a chain's legs with the economics that decide whether one can be shed.
+fn print_legs(cfg: &Config, target: &str, indent: &str) {
+    let legs: Vec<String> = match cfg.chains.get(target) {
+        Some(c) => c.order.clone(),
+        None if cfg.backends.contains_key(target) => vec![target.to_string()],
+        None => {
+            println!("{indent}(unresolvable: '{target}' is not a chain or backend)");
+            return;
+        }
+    };
+    for (i, name) in legs.iter().enumerate() {
+        match cfg.backends.get(name) {
+            Some(b) => println!(
+                "{indent}{i}. {name} [{}, cost={}, agentic={}]",
+                b.type_str(),
+                b.cost_class(),
+                b.is_agentic()
+            ),
+            None => println!("{indent}{i}. {name} (UNDEFINED)"),
+        }
+    }
+}
+
+/// §12 `--replay <file.jsonl>`: score a captured corpus offline and sweep
+/// `confidence_threshold`.
+///
+/// No model calls, no server — which is exactly why `route::signals` and
+/// `route::scorer` are pure functions over `&Value`. This is the harness that
+/// turns the thresholds from guesses into measurements.
+fn run_replay(file: &str) -> ExitCode {
+    const THRESHOLDS: [f64; 5] = [0.0, 0.3, 0.5, 0.7, 0.9];
+    let path = config::tilde_path(file);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("tmuxlet-server: cannot read {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut scored: Vec<(String, route::scorer::Score)> = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("tmuxlet-server: {}:{}: {e}", path.display(), n + 1);
+                return ExitCode::FAILURE;
+            }
+        };
+        let id = v
+            .get("id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("-")
+            .to_string();
+        let messages = v
+            .get("messages")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let sig = route::signals::extract(&messages, route::signals::DEFAULT_RECENT_WINDOW);
+        let sc = route::scorer::score(&sig);
+        let turns = messages.as_array().map_or(0, |a| a.len());
+        println!(
+            "conversation {id}: turns={turns} score={:+.3} confidence={:.3} signals=w/e/r/t={}/{}/{}/{} sev={:.2} depth={} compacted={}",
+            sc.score,
+            sc.confidence,
+            sig.recent_write_count,
+            sig.recent_edit_count,
+            sig.recent_read_count,
+            sig.recent_todowrite_count,
+            sig.severity,
+            sig.turn_depth,
+            sig.compacted,
+        );
+        scored.push((id, sc));
+    }
+    if scored.is_empty() {
+        eprintln!("tmuxlet-server: {} has no conversations", path.display());
+        return ExitCode::FAILURE;
+    }
+    // The routing split per threshold. "shed" is a turn the scorer would move off
+    // leg 0 *while rationing*; below reserve_threshold none of them move at all.
+    for t in THRESHOLDS {
+        let shed = scored
+            .iter()
+            .filter(|(_, sc)| !(sc.confidence >= t && sc.score > 0.0))
+            .count();
+        println!("threshold {t:.2}: keep={} shed={shed}", scored.len() - shed);
+    }
+    ExitCode::SUCCESS
 }

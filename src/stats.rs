@@ -134,6 +134,10 @@ fn percentile(sorted: &[u64], q: f64) -> u64 {
 /// Per-backend traffic. The quota fields mirror §7.5's `QuotaState`; here they
 /// are counted and nothing more.
 struct BackendStat {
+    /// §7.5: the window `calls_in_window` counts over. Per-backend, because a
+    /// subscription's window and an API key's are not the same length. Defaults
+    /// to `QUOTA_WINDOW` until `set_quota_window` says otherwise.
+    window: Duration,
     success: u64,
     retryable: u64,
     other: u64,
@@ -153,6 +157,7 @@ struct BackendStat {
 impl BackendStat {
     fn new(now: Instant) -> Self {
         BackendStat {
+            window: QUOTA_WINDOW,
             success: 0,
             retryable: 0,
             other: 0,
@@ -376,13 +381,8 @@ impl Stats {
     /// §7.5 pressure for one backend. `None` when the limit is unknown and the
     /// backend is not currently exhausted.
     ///
-    /// `allow(dead_code)` is load-bearing and deliberate, not an oversight: §5.2
-    /// says the quota block ships in **Phase 1**, "even though nothing consumes it
-    /// until Phase 3 — it is pure observation, and per §13 it is the measurement
-    /// that decides whether Phase 3 gets built at all." The reader is the
-    /// `SignalPolicy` cascade; until it lands, only `/v1/stats` and the tests here
-    /// look at this. Drop the attribute when Phase 3 adds the caller.
-    #[allow(dead_code)]
+    /// Read by the §7.7 cascade: rung 2 skips leg 0 at 1.0, rung 4 takes the fast
+    /// path below `reserve_threshold`.
     pub fn pressure(&self, name: &str) -> Option<f64> {
         let now = Instant::now();
         let mut inner = self.inner();
@@ -391,16 +391,41 @@ impl Stats {
         stat.pressure(now)
     }
 
-    /// Configure or learn a per-backend quota limit (§7.5 tiers 2 and 3). Phase 1
-    /// never calls this, which is why Phase 1 always reads back `None` — and why
-    /// an unconfigured server behaves exactly as it does today until it hits a
-    /// 429. Phase 3 wires `quota_calls` and `quota_learn` to it; see the note on
-    /// `pressure` above for why the attribute is here.
-    #[allow(dead_code)]
+    /// §7.5 tier 2: the operator told us the limit. Called once at startup from
+    /// `quota_calls`.
     pub fn set_limit_hint(&self, name: &str, limit: Option<u32>) {
         let now = Instant::now();
         let mut inner = self.inner();
         inner.backend(name, now).limit_hint = limit;
+    }
+
+    /// §7.5: override the per-backend quota window. Called once at startup from
+    /// `quota_window_secs`; a zero or absent value keeps the default.
+    pub fn set_quota_window(&self, name: &str, secs: u64) {
+        if secs == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut inner = self.inner();
+        inner.backend(name, now).window = Duration::from_secs(secs);
+    }
+
+    /// §7.5 tier 3: learn the limit from where a 429 landed.
+    ///
+    /// Costs one failed leg per window to discover, and is the only option that
+    /// works when the provider's limit is opaque or varies with load. Records the
+    /// **current** `calls_in_window` — the count that just proved to be too many —
+    /// and only ever lowers an existing hint, so one anomalously high window
+    /// cannot inflate the estimate permanently.
+    pub fn learn_limit(&self, name: &str) {
+        let now = Instant::now();
+        let mut inner = self.inner();
+        let stat = inner.backend(name, now);
+        let observed = stat.calls_in_window.max(1);
+        stat.limit_hint = Some(match stat.limit_hint {
+            Some(prev) => prev.min(observed),
+            None => observed,
+        });
     }
 
     /// `POST /v1/stats/reset` — for benchmarking runs (§5.2).

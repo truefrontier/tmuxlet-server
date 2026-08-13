@@ -378,13 +378,20 @@ fn the_configured_session_max_is_a_cap_not_a_default() {
 // Exclusions are a property of the chain, not of a router, so these configs
 // have no `[routers]` table at all.
 
-/// Bind `port` and answer exactly `times` HTTP requests with `response`, one at
-/// a time, then drop the listener. Same read-drain-respond shape as the helper
-/// in tests/routes.rs; the count is what lets a test prove a leg was *not*
-/// contacted again — the budget is spent, so a repeat contact cannot succeed.
-fn mock_upstream(port: u16, response: String, times: usize) -> thread::JoinHandle<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind mock upstream");
-    thread::spawn(move || {
+/// A mock upstream that answers exactly `times` HTTP requests with `response`,
+/// one at a time, then drops its listener. Returns the port it actually bound.
+///
+/// Same read-drain-respond shape as the helper in tests/routes.rs, with two
+/// deliberate differences. It binds :0 and reports back rather than taking a
+/// port from `common::free_port()` — free_port drops its listener before the
+/// caller rebinds, and a mock that holds a port for the whole test widens that
+/// window enough to steal a port out from under a server starting in a parallel
+/// test. And `times` is what lets a test prove a leg was *not* contacted again:
+/// the budget is spent, so a repeat contact could not have succeeded.
+fn mock_upstream(response: String, times: usize) -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock upstream");
+    let port = listener.local_addr().expect("mock upstream addr").port();
+    let handle = thread::spawn(move || {
         for _ in 0..times {
             let Ok((mut sock, _)) = listener.accept() else {
                 return;
@@ -423,7 +430,8 @@ fn mock_upstream(port: u16, response: String, times: usize) -> thread::JoinHandl
             let _ = sock.write_all(response.as_bytes());
             let _ = sock.flush();
         }
-    })
+    });
+    (port, handle)
 }
 
 fn http_response(status: u16, reason: &str, body: &str) -> String {
@@ -486,9 +494,8 @@ fn an_overflowed_leg_is_skipped_for_the_rest_of_the_session() {
     // fit turn 2 — paying for the 400 again is pure latency. leg1 gets exactly
     // one listener, so a second contact could not have succeeded; the stats
     // count is what proves it was never attempted.
-    let (p1, p2) = (common::free_port(), common::free_port());
-    let _m1 = mock_upstream(p1, overflow_response(), 1);
-    let _m2 = mock_upstream(p2, ok_response("from-leg2"), 2);
+    let (p1, _m1) = mock_upstream(overflow_response(), 1);
+    let (p2, _m2) = mock_upstream(ok_response("from-leg2"), 2);
     let server = common::start(&two_leg_api_config(common::free_port(), p1, p2));
     let hdrs = [("x-tmuxlet-session-id", "conv-1")];
 
@@ -520,9 +527,8 @@ fn an_excluded_leg_reports_why_when_every_leg_is_excluded() {
     // The skip is visible to the client, not just to the log: turn 2 never
     // touches an upstream (both mocks are spent), so the only way the body can
     // name a reason is if the chain skipped both legs itself.
-    let (p1, p2) = (common::free_port(), common::free_port());
-    let _m1 = mock_upstream(p1, overflow_response(), 1);
-    let _m2 = mock_upstream(p2, overflow_response(), 1);
+    let (p1, _m1) = mock_upstream(overflow_response(), 1);
+    let (p2, _m2) = mock_upstream(overflow_response(), 1);
     let server = common::start(&two_leg_api_config(common::free_port(), p1, p2));
     let hdrs = [("x-tmuxlet-session-id", "conv-1")];
 

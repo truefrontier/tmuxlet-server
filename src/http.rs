@@ -3,13 +3,13 @@
 //! Everything about *which* backend answers lives in `route/`; everything about
 //! *running* it lives in `exec/`. What is left here is the wire.
 
-use crate::backend::{Backend, BackendError, DispatchResult};
+use crate::backend::{Backend, BackendError};
 use crate::config::Config;
 use crate::env::Env;
-use crate::exec::chain::{self, BackendHealth, ChainCtx};
+use crate::exec::chain::{self, BackendHealth, ChainCtx, StreamOutcome};
 use crate::log;
-use crate::proto::openai;
-use crate::route::policy::{ClassifierPolicy, Policy, StaticPolicy};
+use crate::proto::{anthropic, openai};
+use crate::route::policy::{ClassifierPolicy, Policy, SignalPolicy, StaticPolicy};
 use crate::route::session::{self, SessionKey, SessionStore};
 use crate::route::{Decision, DecisionSource, RequestCtx};
 use crate::stats::Stats;
@@ -32,6 +32,8 @@ pub enum Route {
     StatsReset,
     /// §5.3: Prometheus exposition, only when `[server] metrics = true`.
     Metrics,
+    /// §9.1: Anthropic Messages, text-only.
+    Messages,
     Reserved,
     NotFound,
     /// U-17: a known path reached with the wrong method. Carries the `Allow` value.
@@ -49,13 +51,16 @@ pub fn classify(method: &str, path: &str) -> Route {
         ("GET", "/metrics") => Route::Metrics,
         ("POST", "/v1/stats/reset") => Route::StatsReset,
         ("POST", "/v1/chat/completions") => Route::Chat,
+        ("POST", "/v1/messages") => Route::Messages,
         // U-17: known path, wrong method → 405 with an Allow header.
         (_, "/health")
         | (_, "/v1/models")
         | (_, "/v1/backends")
         | (_, "/v1/stats")
         | (_, "/metrics") => Route::MethodNotAllowed("GET, HEAD"),
-        (_, "/v1/chat/completions") | (_, "/v1/stats/reset") => Route::MethodNotAllowed("POST"),
+        (_, "/v1/chat/completions") | (_, "/v1/messages") | (_, "/v1/stats/reset") => {
+            Route::MethodNotAllowed("POST")
+        }
         _ if path == "/" || path.starts_with("/ui") || path.starts_with("/api") => Route::Reserved,
         _ => Route::NotFound,
     }
@@ -127,18 +132,34 @@ impl State {
         stats: Arc<Stats>,
         sessions: Arc<SessionStore>,
     ) -> State {
-        // §3.2: a `[routers.x]` table builds a ClassifierPolicy; Phase 3 adds the
-        // `signals` variants here. Everything else shares one StaticPolicy.
+        // §3.2: policy selection is a startup decision. `type = "signals"` builds
+        // the quota-aware cascade; anything else is the §5 auto-router. Everything
+        // that is not a router shares one StaticPolicy.
         let policies: HashMap<String, Box<dyn Policy>> = cfg
             .routers
-            .keys()
-            .map(|name| {
-                let p: Box<dyn Policy> = Box::new(ClassifierPolicy {
-                    router: name.clone(),
-                });
+            .iter()
+            .map(|(name, r)| {
+                let p: Box<dyn Policy> = if r.kind == "signals" {
+                    Box::new(SignalPolicy {
+                        router: name.clone(),
+                    })
+                } else {
+                    Box::new(ClassifierPolicy {
+                        router: name.clone(),
+                    })
+                };
                 (name.clone(), p)
             })
             .collect();
+        // §7.5 tiers 2 and 3 are startup facts, so seed them before serving.
+        for (name, b) in &cfg.backends {
+            if let Some(n) = b.quota_calls() {
+                stats.set_limit_hint(name, Some(n));
+            }
+            if let Some(w) = b.quota_window_secs() {
+                stats.set_quota_window(name, w);
+            }
+        }
         State {
             cfg,
             env,
@@ -346,6 +367,7 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
             route,
             Route::Models
                 | Route::Chat
+                | Route::Messages
                 | Route::Backends
                 | Route::Stats
                 | Route::StatsReset
@@ -462,7 +484,8 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
             "invalid_request_error",
             Some("unknown_route"),
         ),
-        Route::Chat => {
+        Route::Chat | Route::Messages => {
+            let anthropic_shape = matches!(route, Route::Messages);
             // Cap the body read so a malformed/huge payload can't exhaust memory.
             const MAX_BODY: u64 = 16 * 1024 * 1024; // 16 MiB
             let mut raw = String::new();
@@ -492,7 +515,7 @@ pub fn handle(mut req: Request, state: &Arc<State>) {
             // §6.1: the id has to come off the raw request, so it is read here
             // and handed down — `handle_chat` has already given the Request away
             // by the time it needs it.
-            handle_chat(req, &raw, state, header_session);
+            handle_chat(req, &raw, state, header_session, anthropic_shape);
         }
     }
 }
@@ -591,9 +614,32 @@ fn decision_headers(
     h
 }
 
-fn handle_chat(req: Request, raw: &str, state: &Arc<State>, header_session: Option<SessionKey>) {
+fn handle_chat(
+    req: Request,
+    raw: &str,
+    state: &Arc<State>,
+    header_session: Option<SessionKey>,
+    anthropic_shape: bool,
+) {
     let reqid = log::next_reqid();
     let req_start = Instant::now();
+    // §9.1: an Anthropic request is normalized to the OpenAI shape right here, so
+    // routing, the classifier, signal extraction, prompt shaping, and the `api`
+    // backends downstream all see exactly one wire format. Only the *response*
+    // envelope differs, which is why the translation is ~250 LOC rather than
+    // Switchyard's 11.5k-line crate: we refuse tool-call round-tripping.
+    let normalized;
+    let raw = if anthropic_shape {
+        match normalize_anthropic(raw) {
+            Ok(v) => {
+                normalized = v;
+                normalized.as_str()
+            }
+            Err((status, body)) => return respond_json(req, status, body),
+        }
+    } else {
+        raw
+    };
     // P-2: parse the body once to a Value, then deserialize the typed view.
     let raw_value: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -645,6 +691,7 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>, header_session: Opti
     let ctx = RequestCtx {
         model: &model,
         messages: &parsed.messages,
+        raw: &raw_value,
         cfg: &state.cfg,
         reqid: &reqid,
         session: sess.as_ref(),
@@ -663,14 +710,33 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>, header_session: Opti
     }
     state.stats.record_decision(decision.source.as_str());
 
+    // §8: the gate belongs to the chain the decision landed on, not to the model
+    // the client asked for — a router's classes can point at chains with
+    // different gates.
+    let gate_cfg = decision
+        .chain
+        .as_ref()
+        .and_then(|c| state.cfg.chains.get(c))
+        .and_then(|c| c.gate.as_ref());
+
     let prompt = openai::flatten_to_prompt(&parsed.messages);
     let last_user = openai::last_user_prompt(&parsed.messages); // U-14
     let default_to = Duration::from_secs(state.cfg.server.request_timeout_secs);
 
     if parsed.stream {
         stream_with_keepalive(
-            req, state, decision, prompt, last_user, raw_value, default_to, reqid, req_start,
-            model, sess,
+            req,
+            state,
+            decision,
+            prompt,
+            last_user,
+            raw_value,
+            default_to,
+            reqid,
+            req_start,
+            model,
+            sess,
+            anthropic_shape,
         );
         return;
     }
@@ -687,6 +753,7 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>, header_session: Opti
             default_to,
             reqid: &reqid,
             session: sess.as_ref(),
+            gate: gate_cfg,
         },
     ) {
         Ok((result, winner)) => {
@@ -699,13 +766,21 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>, header_session: Opti
                 Some(&winner),
                 first,
             );
-            let id = format!("chatcmpl-{}", result.model_label);
-            let body = serde_json::to_string(&openai::build_completion(
-                id,
-                result.model_label,
-                result.content,
-            ))
-            .unwrap();
+            let body = if anthropic_shape {
+                anthropic::build_message(
+                    format!("msg_{}", result.model_label),
+                    result.model_label,
+                    result.content,
+                )
+                .to_string()
+            } else {
+                serde_json::to_string(&openai::build_completion(
+                    format!("chatcmpl-{}", result.model_label),
+                    result.model_label,
+                    result.content,
+                ))
+                .unwrap()
+            };
             let mut resp = Response::from_string(body)
                 .with_header(header("Content-Type", "application/json"))
                 .with_status_code(StatusCode(200));
@@ -735,18 +810,48 @@ fn handle_chat(req: Request, raw: &str, state: &Arc<State>, header_session: Opti
     }
 }
 
+/// §9.1: turn an Anthropic Messages body into the OpenAI body the rest of the
+/// server speaks. `Err` carries a ready-to-send `(status, body)` in Anthropic's
+/// own error envelope — a client on this endpoint should not get an OpenAI-shaped
+/// error back.
+fn normalize_anthropic(raw: &str) -> Result<String, (u16, String)> {
+    let parsed: anthropic::MessagesRequest = serde_json::from_str(raw).map_err(|e| {
+        (
+            400,
+            anthropic::error_envelope("invalid_request_error", &format!("parse error: {e}"))
+                .to_string(),
+        )
+    })?;
+    // Refuse loudly rather than silently returning prose where the caller
+    // expected a tool_use block. Silent wrongness is the failure mode worth
+    // refusing; the README states the same ceiling.
+    if parsed.has_tools() {
+        return Err((
+            400,
+            anthropic::error_envelope(
+                "invalid_request_error",
+                "this endpoint is text-only: `tools` is not supported and no tool_use blocks will be returned. Use /v1/chat/completions with a backend that speaks tools.",
+            )
+            .to_string(),
+        ));
+    }
+    Ok(serde_json::json!({
+        "model": parsed.model(),
+        "stream": parsed.stream(),
+        "messages": openai::messages_to_json(&parsed.to_openai_messages()),
+    })
+    .to_string())
+}
+
 /// A3: run the streaming dispatch, converting a panic into an in-band chain
 /// error. Without this, a panic on the dispatch thread drops `rtx` silently and
 /// the coordinator ends the already-committed 200 SSE stream at clean EOF — no
 /// error, no `data: [DONE]`, indistinguishable from an empty success. The server
 /// is built to survive dispatch panics (F-3), so map them to the same 503 body
 /// the non-streaming path returns.
-fn dispatch_or_panic_error<F>(
-    reqid: &str,
-    f: F,
-) -> Result<(DispatchResult, String), Vec<BackendError>>
+fn dispatch_or_panic_error<T, F>(reqid: &str, f: F) -> Result<T, Vec<BackendError>>
 where
-    F: FnOnce() -> Result<(DispatchResult, String), Vec<BackendError>>,
+    F: FnOnce() -> Result<T, Vec<BackendError>>,
 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(r) => r,
@@ -777,19 +882,45 @@ fn stream_with_keepalive(
     req_start: Instant,
     model: String,
     session: Option<SessionKey>,
+    anthropic_shape: bool,
 ) {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let (rtx, rrx) = mpsc::channel::<Result<(DispatchResult, String), Vec<BackendError>>>();
+    let (rtx, rrx) = mpsc::channel::<Result<StreamOutcome, Vec<BackendError>>>();
     let redact = state.redact_errors;
     let state_dispatch = Arc::clone(state);
     let stats = Arc::clone(&state.stats);
     let reqid2 = reqid.clone();
     let names = decision.legs.clone();
     let first = names.first().cloned();
+    // The dispatch thread holds its own Arc<State>, so re-resolve the gate there
+    // rather than smuggling a borrow of `state.cfg` across the spawn.
+    let gate_chain = decision.chain.clone();
+    let model2 = model.clone();
+    // §9.2: the dispatch thread relays deltas straight onto the SSE channel as
+    // they arrive. `first` flips on the first token — the commit point — and the
+    // role-priming frame goes out with it so the client sees a well-formed
+    // OpenAI stream rather than bare content deltas.
+    let tx_deltas = tx.clone();
+    let stream_id = format!("chatcmpl-{model}");
     std::thread::spawn(move || {
         let names_ref: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let mut primed = false;
         let r = dispatch_or_panic_error(&reqid2, || {
-            chain::run(
+            let mut on_delta = |d: &str| {
+                if !primed {
+                    primed = true;
+                    if tx_deltas
+                        .send(openai::stream_role_frame(&stream_id, &model2).into_bytes())
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+                tx_deltas
+                    .send(openai::stream_delta_frame(&stream_id, &model2, d).into_bytes())
+                    .is_ok()
+            };
+            chain::run_streaming(
                 &state_dispatch,
                 &ChainCtx {
                     legs: &names_ref,
@@ -799,7 +930,12 @@ fn stream_with_keepalive(
                     default_to,
                     reqid: &reqid2,
                     session: session.as_ref(),
+                    gate: gate_chain
+                        .as_ref()
+                        .and_then(|c| state_dispatch.cfg.chains.get(c))
+                        .and_then(|c| c.gate.as_ref()),
                 },
+                &mut on_delta,
             )
         });
         let _ = rtx.send(r);
@@ -807,10 +943,7 @@ fn stream_with_keepalive(
     let route_for_log = decision.label.clone();
     // §5.1: the route header value is built here, before `model` moves into the
     // coordinator thread. The winner is deliberately absent — see below.
-    let route_header = crate::route::header_safe(&match &decision.label {
-        Some(l) => format!("{model}/{l}"),
-        None => model.clone(),
-    });
+    let route_header = decision.route_header_prefix(&model);
     std::thread::spawn(move || {
         let final_result = loop {
             match rrx.recv_timeout(Duration::from_secs(15)) {
@@ -845,7 +978,11 @@ fn stream_with_keepalive(
         };
         let elapsed_ms = req_start.elapsed().as_millis() as u64;
         match final_result {
-            Ok((result, winner)) => {
+            Ok(StreamOutcome {
+                result,
+                winner,
+                streamed,
+            }) => {
                 stats.record_request(true);
                 log_request_summary(
                     &reqid,
@@ -856,9 +993,34 @@ fn stream_with_keepalive(
                     first.as_deref(),
                 );
                 let id = format!("chatcmpl-{}", result.model_label);
-                for f in openai::stream_frames(&id, &result.model_label, &result.content) {
-                    if tx.send(f.into_bytes()).is_err() {
-                        return;
+                if anthropic_shape {
+                    // §9.1: Anthropic's event sequence differs from OpenAI's and
+                    // its frames carry an `event:` line as well as `data:`, so a
+                    // relayed OpenAI stream cannot be re-shaped after the fact.
+                    // The Anthropic surface therefore always buffers.
+                    for f in anthropic::stream_events(
+                        &format!("msg_{}", result.model_label),
+                        &result.model_label,
+                        &result.content,
+                    ) {
+                        if tx.send(f.into_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                } else if streamed {
+                    // The deltas already went out live; only the tail is left.
+                    for f in openai::stream_tail_frames(&id, &result.model_label) {
+                        if tx.send(f.into_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                } else {
+                    // A blocking backend (tmuxlet/cli, permanently — the child
+                    // emits at exit) still emits the whole reply at once.
+                    for f in openai::stream_frames(&id, &result.model_label, &result.content) {
+                        if tx.send(f.into_bytes()).is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -1002,17 +1164,33 @@ fn handle_recovering<F: FnOnce()>(f: F) -> bool {
     }
 }
 
-pub fn serve(server: Arc<Server>, state: Arc<State>, workers: usize) {
+/// U-22: the live `State`, swappable under SIGHUP.
+///
+/// Workers read the current `Arc<State>` once per request and then let go of the
+/// lock, so a reload never blocks a dispatch and **in-flight requests finish on
+/// the config they started with**. The read is a pointer clone against a turn
+/// that runs for minutes; it does not show up.
+pub type StateHolder = Arc<std::sync::RwLock<Arc<State>>>;
+
+pub fn serve(server: Arc<Server>, holder: StateHolder, workers: usize) {
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
         let server = Arc::clone(&server);
-        let state = Arc::clone(&state);
+        let holder = Arc::clone(&holder);
         handles.push(std::thread::spawn(move || {
             while let Ok(req) = server.recv() {
+                // Snapshot the current config for this request, then release the
+                // lock immediately — a reload mid-turn must not stall a worker.
+                let st = match holder.read() {
+                    Ok(g) => Arc::clone(&g),
+                    // A poisoned holder means a reload panicked mid-swap. Routing
+                    // must not stop; the value itself is a whole Arc<State>, so
+                    // there is no torn state to observe.
+                    Err(e) => Arc::clone(&e.into_inner()),
+                };
                 // F-3: a panic while handling one request must not tear down the
                 // worker (which would silently shrink capacity).
-                let st = &state;
-                handle_recovering(|| handle(req, st));
+                handle_recovering(|| handle(req, &st));
             }
         }));
     }
@@ -1087,7 +1265,7 @@ mod tests {
         // A3: a panicking dispatch maps to an all_backends_failed body (which the
         // streaming coordinator then wraps with data: [DONE]) — never a silent
         // clean-EOF stream.
-        let r = dispatch_or_panic_error("test", || panic!("boom"));
+        let r = dispatch_or_panic_error::<(), _>("test", || panic!("boom"));
         let errs = r.expect_err("panic must become an error result");
         let body = build_503_body(&errs, false);
         assert!(

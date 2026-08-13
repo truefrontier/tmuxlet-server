@@ -1,0 +1,114 @@
+tmuxlet-server
+Copyright (c) 2026 Codefi Foundation on Rural Innovation
+(https://codefiworks.com)
+
+This product includes software derived from work developed at
+NVIDIA CORPORATION & AFFILIATES.
+
+================================================================================
+Portions derived from NVIDIA-NeMo/Switchyard
+================================================================================
+
+Copyright (c) NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Origin
+------
+
+  Repository: https://github.com/NVIDIA-NeMo/Switchyard
+  Files:      crates/libsy/src/algorithms/util/tool_signals.rs
+              crates/libsy/src/algorithms/util/stage.rs
+  Read at branch `main` on 2026-08-11. No upstream commit hash was recorded at
+  the time, so this notice pins the date rather than a revision.
+
+Files in this repository containing derived material
+----------------------------------------------------
+
+  src/route/signals.rs
+  src/route/scorer.rs
+
+No other file in this repository derives from Switchyard.
+
+What is derived
+---------------
+
+1. src/route/signals.rs — the design of three lookup tables and two matching
+   rules:
+
+   * ERROR_PATTERNS: a substring table over tool-result text, keyed by a
+     three-tier severity scale (critical 1.0 / hard 0.7 / soft 0.3), reduced by
+     taking the maximum over a sliding window of recent results.
+
+   * The tool-name table categorizing tool calls into write / edit / read /
+     todowrite, with generic shell tools falling through to command-pattern
+     matching.
+
+   * The test-phrase table used to recognize a passing test run.
+
+   * Two specific matching rules, reproduced deliberately because they are the
+     non-obvious, trace-mined part of the upstream work:
+
+       - "file does not exist" is anchored as a full phrase rather than a bare
+         "does not exist", which fires on `ls` output and on ordinary prose.
+
+       - The test-failure keywords ("failed", "errors") only count when a
+         non-zero integer immediately precedes them, so cargo's `0 failed` and
+         go's `0 errors` on a clean run are not misread as failures.
+
+2. src/route/scorer.rs — the scoring constants and the formula that combines
+   them (upstream stage.rs, lines 35-47 and 244-321):
+
+       SIGNAL_UNIT        = 0.10
+       SCORE_GAIN         = 5.0
+       HARD_SEVERITY      = 0.7
+       STALL_MIN_TURN_DEPTH = 8
+
+       raw   = SIGNAL_UNIT * (severity / HARD_SEVERITY
+                              + spinning + exploring - production)
+       score = tanh(SCORE_GAIN * raw)
+
+   together with the spinning / exploring / production decomposition those
+   terms name, the sign convention (positive = capable, negative = efficient),
+   and the resulting calibration (one maxed signal = tanh(0.5) = 0.462; two
+   corroborating signals = tanh(1.0) = 0.762).
+
+What is not derived
+-------------------
+
+The following, also present in those two files, is original to this repository
+and carries the MIT license in LICENSE:
+
+  * The concrete entries of every table above. They were selected for the
+    harnesses tmuxlet-server actually fronts — claude-code, codex,
+    hermes-style, and generic shells — and are documented inline. Where an
+    entry coincides with upstream's, it does so because both name the same
+    well-known error or tool string.
+
+  * The Bash-command pattern matching that classifies generic shell tools, and
+    the file-descriptor-redirection guard it uses.
+
+  * extract()'s traversal of the OpenAI `messages` array, its defensive
+    handling of malformed JSON, the argument normalization across wire shapes,
+    and the context-compaction marker detection.
+
+  * The public API surface — ToolSignals, Score, extract(), score(),
+    should_escalate(), should_deescalate() — and every test.
+
+Scope note: upstream's cost model assumes a linear per-call price for the
+capable tier. tmuxlet-server's quota-pressure model (docs/specs
+2026-08-11-v2-routing-architecture.md, sections 7.3 through 7.7) replaces that
+assumption entirely and is not derived from Switchyard.
+
+This notice is a good-faith description of the derivation for the purposes of
+Apache-2.0 section 4. It is not legal advice.

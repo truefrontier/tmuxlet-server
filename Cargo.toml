@@ -21,7 +21,10 @@ webpki-roots = "1.0.7"
 portable-pty = "0.9.0"
 # Already in the tree via portable-pty; declared directly only to disable PTY
 # echo (termios) so captured backend output isn't polluted by echoed stdin.
-nix = { version = "0.28", features = ["term"] }
+# `term` disables PTY echo; `signal` registers the U-22 SIGHUP reload handler.
+# Both are features of a crate already in the tree via portable-pty — no new
+# dependency, which §0 of the v2 spec makes a hard constraint.
+nix = { version = "0.28", features = ["term", "signal"] }
 
 [dev-dependencies]
 # Test-only HTTP client (auto-dechunks SSE responses). http-only: no TLS needed

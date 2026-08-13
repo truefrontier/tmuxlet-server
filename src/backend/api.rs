@@ -98,7 +98,7 @@ pub fn dispatch(
         .api_key_env
         .as_ref()
         .and_then(|k| env.get(k).map(str::to_string));
-    let (status, resp) = http_client::post_json(
+    let (status, resp, retry_after) = http_client::post_json(
         &scheme,
         &host,
         port,
@@ -129,6 +129,13 @@ pub fn dispatch(
         if super::is_context_overflow(status, &resp) {
             return Err(BackendError::Overflow(b.name.clone(), detail));
         }
+        if status == 429 {
+            return Err(BackendError::RateLimited(
+                b.name.clone(),
+                retry_after.map(Duration::from_secs),
+                detail,
+            ));
+        }
         return Err(BackendError::Http(b.name.clone(), status, detail));
     }
     let content = extract_content(&b.name, &resp)?;
@@ -138,9 +145,141 @@ pub fn dispatch(
     })
 }
 
+/// §9.2: dispatch with `stream: true` upstream and relay deltas as they arrive.
+///
+/// **The commit point is the first delta.** Everything that can fail — connect,
+/// TLS, a non-2xx status, an unparseable first frame — fails before `on_delta`
+/// is ever called, so the chain can still fall through with nothing written to
+/// the client. After the first delta there is no un-sending it, and this backend
+/// owns the response.
+///
+/// Returns the accumulated text so the caller can still log and record it, and
+/// so a stream that produced nothing is indistinguishable from an empty reply
+/// (and is rejected by the same NonEmptyGate).
+pub fn dispatch_stream(
+    b: &ApiBackend,
+    raw_messages: &serde_json::Value,
+    env: &Env,
+    timeout: Duration,
+    on_delta: &mut dyn FnMut(&str) -> bool,
+) -> Result<DispatchResult, BackendError> {
+    let (scheme, host, port, base_path) = split_url(&b.base_url);
+    let path = format!("{}/chat/completions", base_path.trim_end_matches('/'));
+    let mut body = build_body(raw_messages, &b.extra_body, &b.model);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("stream".into(), serde_json::json!(true));
+    }
+    let bearer = b
+        .api_key_env
+        .as_ref()
+        .and_then(|k| env.get(k).map(str::to_string));
+
+    let mut content = String::new();
+    let mut carry = String::new();
+    let mut alive = true;
+    let (status, resp, retry_after) = http_client::post_json_stream(
+        &scheme,
+        &host,
+        port,
+        &path,
+        bearer.as_deref(),
+        &body.to_string(),
+        timeout,
+        b.max_response_bytes as usize,
+        b.ca_file.as_deref(),
+        &mut |bytes| {
+            carry.push_str(&String::from_utf8_lossy(bytes));
+            // SSE frames are separated by a blank line; hold any partial tail.
+            while let Some(i) = carry.find("\n\n") {
+                let frame: String = carry.drain(..i + 2).collect();
+                for line in frame.lines() {
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let data = data.trim();
+                    if data == "[DONE]" || data.is_empty() {
+                        continue;
+                    }
+                    if let Some(delta) = delta_text(data) {
+                        content.push_str(&delta);
+                        if !on_delta(&delta) {
+                            alive = false;
+                        }
+                    }
+                }
+            }
+            alive
+        },
+    )
+    .map_err(|e| {
+        let m = e.to_string();
+        if e.kind() == std::io::ErrorKind::FileTooLarge {
+            BackendError::Parse(b.name.clone(), m)
+        } else {
+            BackendError::Spawn(b.name.clone(), m)
+        }
+    })?;
+
+    if !(200..300).contains(&status) {
+        let detail = error_snippet(&resp);
+        if super::is_context_overflow(status, &resp) {
+            return Err(BackendError::Overflow(b.name.clone(), detail));
+        }
+        if status == 429 {
+            return Err(BackendError::RateLimited(
+                b.name.clone(),
+                retry_after.map(Duration::from_secs),
+                detail,
+            ));
+        }
+        return Err(BackendError::Http(b.name.clone(), status, detail));
+    }
+    Ok(DispatchResult {
+        content,
+        model_label: b.model.clone(),
+    })
+}
+
+/// Pull `choices[0].delta.content` out of one SSE data payload. `None` for the
+/// role-priming frame and anything else without text — those are not errors.
+fn delta_text(data: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    v.get("choices")?
+        .get(0)?
+        .get("delta")?
+        .get("content")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_text_reads_content_and_ignores_the_rest() {
+        // §9.2: the role-priming frame and finish-reason frame carry no text and
+        // are not errors — treating them as failures would break every stream.
+        assert_eq!(
+            delta_text(r#"{"choices":[{"delta":{"content":"Hel"}}]}"#).as_deref(),
+            Some("Hel")
+        );
+        assert_eq!(
+            delta_text(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#),
+            None
+        );
+        assert_eq!(
+            delta_text(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+            None
+        );
+        assert_eq!(
+            delta_text(r#"{"choices":[{"delta":{"content":""}}]}"#),
+            None
+        );
+        assert_eq!(delta_text("not json"), None);
+        assert_eq!(delta_text("{}"), None);
+    }
 
     #[test]
     fn merges_extra_body_then_pins_model() {

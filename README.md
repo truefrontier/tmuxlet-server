@@ -37,19 +37,85 @@ fails to compile with a `recursion limit reached` macro error.
 For step-by-step install + service setup + verification, see
 [`AGENTS.md`](./AGENTS.md). Example config: [`examples/server.toml`](./examples/server.toml).
 
-## HTTP surface (V1)
+## HTTP surface
 
 | Method | Path | Behavior |
 |---|---|---|
 | `GET` | `/health` | `{"status":"ok","version":"…","backends":N,"chains":M}` |
-| `GET` | `/v1/models` | OpenAI-compatible list of chain + backend names |
+| `GET` | `/v1/models` | OpenAI-compatible list of router + chain + backend names |
 | `GET` | `/v1/backends` | per-backend health: `state` (ok\|cooling\|busy\|unknown), consecutive_failures, last_error, last_latency_ms, cooling_secs |
+| `GET` | `/v1/stats` | traffic: requests, routing decisions by provenance, per-backend latency percentiles / errors / cost class / quota, classifier calls, session-map occupancy |
+| `POST` | `/v1/stats/reset` | zero the counters (for benchmarking runs) |
+| `GET` | `/metrics` | Prometheus text format 0.0.4 — **off by default**, enable with `[server] metrics = true` |
 | `POST` | `/v1/chat/completions` | OpenAI chat completions (JSON or SSE) |
 
 Reserved namespaces (`/`, `/ui/*`, `/api/*`) return `501` for a future web UI. A
 known path reached with the wrong method returns `405` with an `Allow` header
 (not `404`); `HEAD` on a GET route mirrors GET with an empty body. Everything
 else returns `404`. Errors use the OpenAI error envelope.
+
+### Response provenance
+
+Every chat response — router-driven or not, success or total failure — carries
+where it went and why:
+
+| Header | Example |
+|---|---|
+| `x-tmuxlet-route` | `do/code/do-code/agy` — `model[/class/target]/backend` |
+| `x-tmuxlet-backend` | `agy` (the leg that actually answered; `-` if none did) |
+| `x-tmuxlet-decision` | `static`, `default`, `affinity`, `quota`, `override`, `settled`, `dimensions`, `classifier`, `fall_open` |
+| `x-tmuxlet-rationale` | `quota pressure 0.82 >= reserve 0.70; shedding a leg` |
+
+`fall_open` is not a synonym for `default`: `default` means the client asked for
+a model we do not know, `fall_open` means we tried to be smart and could not.
+The rationale is bounded, ASCII-sanitized, and **suppressed entirely when bound
+to a non-loopback address** — it names backends and can quote upstream error
+text. On a streaming request the backend header is absent and the route header
+carries no winner: SSE headers are committed before the chain runs, and naming a
+leg that might yet fall through would be a lie.
+
+## Routing
+
+A request's `model` selects a chain, a single backend, or a `[routers.<name>]`
+table. Two router types:
+
+- **`type = "classifier"`** (default) — a cheap model labels the task, and the
+  class picks a chain. The classifier is shown the **opening task plus the latest
+  turn**, not just the latest: on turn 12 of an agent run the latest turn is
+  "yes, continue", which carries no routing signal at all.
+- **`type = "signals"`** — reads the conversation's tool history (writes, edits,
+  reads, error severity, whether the context was compacted) and routes with no
+  LLM call at all. The scorer is a **ranker, not a decider**: quota pressure sets
+  *how many* turns get the flat-rate backend, and the score only chooses *which*
+  ones, and only once headroom is actually scarce.
+
+**Why quota and not dollars.** `claude-max` and `codex` run through tmuxlet
+against an interactive subscription: the marginal cost of a call is zero until
+the quota window is exhausted, then effectively infinite. That is a step
+function, not a line, so "is this task hard enough to deserve the good model" is
+the wrong question — the right one is "how much headroom is left, and is this
+turn worth spending it on". Declare it per backend with
+`cost = "subscription" | "local" | "free" | "metered"`; only `metered` costs
+money at the margin, and rationing exists to protect you from it.
+
+**A turn that ran tools is never shed to a text-only backend.** `codex` writing
+files is not substitutable by a cloud model returning prose *about* writing
+files — the request would "succeed" and return the wrong kind of artifact.
+Spending quota you meant to save is recoverable next window; that is not.
+
+A signals router needs real tool traffic. A plain chat client has no tool
+history, scores 0.0, and lands on leg 0 every time.
+
+## Sessions
+
+If a client sends `x-tmuxlet-session-id`, `x-claude-code-session-id`,
+`x-session-id`, or `x-conversation-id`, the first turn's routing decision is
+reused for the rest of the conversation and the classifier call is skipped
+entirely. A backend that reported a context overflow is excluded for the rest of
+that session — after truncating or resetting context, send a **new** session id.
+The session map is bounded by `session_max` (4096) and `session_ttl_secs`
+(7200): a client-supplied header keying an unbounded map is a
+memory-exhaustion vector.
 
 The `usage` object in completions reports zeros
 (`prompt_tokens`/`completion_tokens`/`total_tokens` = 0) deliberately: the
@@ -63,9 +129,26 @@ Auth is off by default. With `[server] auth = true`, the server generates a
 names an env var holding the token — and clients send
 `Authorization: Bearer <token>` on `/v1/*` (missing/invalid → `401
 unauthorized`). `/health` stays open (no token) for liveness probes.
-`cat ~/.tmuxlet/token` is the whole client setup.
+`cat ~/.tmuxlet/token` is the whole client setup. `/v1/stats`, `/v1/stats/reset`
+and `/metrics` are gated too — they name backends and expose traffic volume,
+which is not something to hand an unauthenticated caller just because a scraper
+finds it convenient.
 
-## Streaming limitation (V1)
+## CLI
+
+```
+tmuxlet-server --validate            # strict config check (--dry-run is an alias)
+tmuxlet-server --check-backends      # probe each backend's reachability
+tmuxlet-server --explain do          # print the policy, cascade and leg order for a model
+tmuxlet-server --replay corpus.jsonl # score a captured corpus offline and sweep thresholds
+```
+
+`--explain` answers "which backend will this model actually hit, and why"
+without sending a request. `--replay` runs captured conversations through the
+scorer with no model calls and no server, which is what makes the routing
+thresholds measurable rather than guessed — see [`docs/replay.md`](./docs/replay.md).
+
+## Streaming limitation
 
 V1 backends are blocking: `cli`/`tmuxlet` emit output only after the child
 exits, and `api` is a single non-streamed call. So with `stream: true` the
@@ -93,6 +176,17 @@ test`) is green on macOS and Linux. See [`docs/STATUS.md`](./docs/STATUS.md) for
 the verification summary and
 [`docs/superpowers/plans/2026-05-28-tmuxlet-server.md`](./docs/superpowers/plans/2026-05-28-tmuxlet-server.md)
 for the design.
+
+## Attribution
+
+The tool-signal tables in `src/route/signals.rs` and the scorer constants and
+formula in `src/route/scorer.rs` are derived from
+[NVIDIA-NeMo/Switchyard](https://github.com/NVIDIA-NeMo/Switchyard)
+(`crates/libsy/src/algorithms/util/{tool_signals,stage}.rs`), Apache-2.0, read at
+`main` on 2026-08-11. See [`NOTICE`](./NOTICE). The trace-mining behind those
+tables — anchoring `"file does not exist"` as a full phrase so it does not fire
+on `ls` output, requiring a non-zero integer before `failed`/`errors` so cargo's
+`0 failed` is not read as a failure — is real work by other people.
 
 ## License
 

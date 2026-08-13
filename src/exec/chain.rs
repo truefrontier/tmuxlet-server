@@ -1,6 +1,8 @@
 //! `run_chain` and the per-backend health it reads and writes.
 
 use crate::backend::{BackendError, DispatchResult};
+use crate::config::GateCfg;
+use crate::exec::gate::{Gate, GateCtx, JudgeGate, NonEmptyGate, Verdict};
 use crate::http::State;
 use crate::log;
 use crate::proto::PromptMode;
@@ -73,11 +75,58 @@ pub struct ChainCtx<'a> {
     /// §6.3: when present, backends this conversation has already overflowed are
     /// skipped, and a fresh overflow is recorded against it.
     pub session: Option<&'a SessionKey>,
+    /// §8: the chain's acceptance gate, if it declared one. `NonEmptyGate` runs
+    /// unconditionally either way.
+    pub gate: Option<&'a GateCfg>,
+}
+
+/// §9.2: what a streaming chain walk did.
+pub struct StreamOutcome {
+    pub result: DispatchResult,
+    pub winner: String,
+    /// True when deltas were relayed live. False means the leg was blocking
+    /// (`tmuxlet`/`cli`, permanently) and the caller must emit the frames itself.
+    pub streamed: bool,
+}
+
+/// Walk the chain, relaying an `api` leg's tokens as they arrive.
+///
+/// **Streaming and chain fallback are mutually exclusive after the first byte.**
+/// Once a `data:` frame has gone out there is no un-sending it, so `on_delta` is
+/// only ever called after the upstream has returned a 2xx and a parseable first
+/// token — every failure before that point still falls through normally. First
+/// token success is the commit point.
+pub fn run_streaming(
+    state: &State,
+    ctx: &ChainCtx,
+    on_delta: &mut dyn FnMut(&str) -> bool,
+) -> Result<StreamOutcome, Vec<BackendError>> {
+    let mut committed = false;
+    let mut sink = |d: &str| {
+        committed = true;
+        on_delta(d)
+    };
+    match run_inner(state, ctx, Some(&mut sink)) {
+        Ok((result, winner)) => Ok(StreamOutcome {
+            result,
+            winner,
+            streamed: committed,
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 /// Walk the chain with P-9 cooldown, P-6 budget, and U-20 concurrency. Returns
 /// the winning result or every leg's error.
 pub fn run(state: &State, ctx: &ChainCtx) -> Result<(DispatchResult, String), Vec<BackendError>> {
+    run_inner(state, ctx, None)
+}
+
+fn run_inner(
+    state: &State,
+    ctx: &ChainCtx,
+    mut on_delta: Option<&mut dyn FnMut(&str) -> bool>,
+) -> Result<(DispatchResult, String), Vec<BackendError>> {
     let ChainCtx {
         legs: names,
         prompt,
@@ -86,15 +135,32 @@ pub fn run(state: &State, ctx: &ChainCtx) -> Result<(DispatchResult, String), Ve
         default_to,
         reqid,
         session,
+        gate,
     } = *ctx;
     let cooldown_on = state.cfg.server.cooldown;
     // §6.3: an overflow exclusion is per-conversation and permanent for that
     // conversation's life — the prompt only grows, so a leg that could not fit it
     // on turn 5 will not fit it on turn 6.
-    let excluded = session
-        .and_then(|k| state.sessions.get(k))
-        .map(|st| st.excluded)
+    let sess = session.and_then(|k| state.sessions.get(k));
+    let excluded = sess
+        .as_ref()
+        .map(|st| st.excluded.clone())
         .unwrap_or_default();
+    // §8: once a session has confirmed an escalation, later turns skip both the
+    // cheap leg and the judge — there is no point re-paying for a verdict this
+    // conversation has already reached.
+    let latched = sess.as_ref().and_then(|st| st.latched.clone());
+    let latch_at = latched
+        .as_ref()
+        .and_then(|l| names.iter().position(|n| n == l))
+        .map(|i| i + 1)
+        .filter(|i| *i < names.len());
+    let judge: Option<JudgeGate> = match (gate, latch_at) {
+        // A latched session has already escalated past the gated leg, so running
+        // the judge again is pure cost.
+        (Some(g), None) if g.kind == "judge" => Some(JudgeGate::from_config(g)),
+        _ => None,
+    };
     let start = Instant::now();
     let budget_deadline = state
         .cfg
@@ -119,6 +185,14 @@ pub fn run(state: &State, ctx: &ChainCtx) -> Result<(DispatchResult, String), Ve
 
     let mut errors: Vec<BackendError> = Vec::new();
     for (i, &name) in names.iter().enumerate() {
+        // §8: skip everything up to and including the leg this session escalated
+        // past. No error is recorded — the leg was not tried, and did not fail.
+        if latch_at.is_some_and(|start| i < start) {
+            log::debug(&format!(
+                "{reqid} skip backend={name}: session latched deeper"
+            ));
+            continue;
+        }
         // P-6: budget exhausted — skip the rest.
         if let Some(dl) = budget_deadline
             && Instant::now() >= dl
@@ -176,14 +250,44 @@ pub fn run(state: &State, ctx: &ChainCtx) -> Result<(DispatchResult, String), Ve
             PromptMode::LastUser => last_user,
             PromptMode::Transcript => prompt,
         };
-        let result = backend.dispatch(leg_prompt, raw_value, &state.env, timeout);
+        // §9.2: stream only when the caller wants it, the backend can do it, and
+        // no gate is waiting to reject this leg — a gate needs the whole answer
+        // before it can judge, and there is no un-sending a relayed token.
+        let can_stream = on_delta.is_some() && backend.supports_streaming() && judge.is_none();
+        let result = match (&mut on_delta, can_stream) {
+            (Some(sink), true) => {
+                backend.dispatch_stream(leg_prompt, raw_value, &state.env, timeout, *sink)
+            }
+            _ => backend.dispatch(leg_prompt, raw_value, &state.env, timeout),
+        };
         let elapsed_ms = leg_start.elapsed().as_millis() as u64;
         match result {
             Ok(res) => {
-                if res.content.trim().is_empty() && !backend.allow_empty() {
-                    let e = BackendError::Backend(name.to_string(), "empty output".into());
+                // §8: a leg that dispatched successfully must also clear the
+                // chain's gates, or it is rejected and the chain advances — the
+                // same path an empty result already takes. NonEmptyGate is V1's
+                // hardcoded check, now just the first gate in the list.
+                let gctx = GateCtx {
+                    state,
+                    backend,
+                    backend_name: name,
+                    prompt: leg_prompt,
+                    session,
+                    reqid,
+                };
+                let mut verdict = NonEmptyGate.check(&res, &gctx);
+                // Only ask the judge about an answer that is actually there, and
+                // only when a deeper leg exists to escalate to.
+                if verdict == Verdict::Accept
+                    && let Some(j) = &judge
+                    && i + 1 < names.len()
+                {
+                    verdict = j.check(&res, &gctx);
+                }
+                if let Verdict::Reject(why) = verdict {
+                    let e = BackendError::Backend(name.to_string(), why.clone());
                     record_failure(state, name, &e, elapsed_ms);
-                    log::warn(&format!("{reqid} skip backend={name}: empty output"));
+                    log::warn(&format!("{reqid} skip backend={name}: {why}"));
                     errors.push(e);
                     continue;
                 }
@@ -224,15 +328,23 @@ pub fn record_failure(state: &State, name: &str, err: &BackendError, latency_ms:
     state
         .stats
         .record_backend(name, outcome_for(err), latency_ms);
-    if let BackendError::Http(_, 429, _) = err {
-        // §7.5: a 429 is the load-bearing quota signal. Absent an upstream
-        // Retry-After the window is the configured cooldown, not a constant —
-        // an operator who set cooldown_secs = 600 meant it. Phase 6 (P-9) threads
-        // the real Retry-After through here.
+    if let BackendError::RateLimited(_, after, _) = err {
+        // §7.5 tier 1: reactive, always on, zero config. The upstream's own
+        // Retry-After beats our guess; absent one, the configured cooldown beats
+        // a constant, because an operator who set cooldown_secs = 600 meant it.
         state.stats.record_rate_limited(
             name,
-            Some(Duration::from_secs(state.cfg.server.cooldown_secs)),
+            Some(after.unwrap_or(Duration::from_secs(state.cfg.server.cooldown_secs))),
         );
+        // §7.5 tier 3: the window that just hit the wall IS the limit estimate.
+        if state
+            .cfg
+            .backends
+            .get(name)
+            .is_some_and(|b| b.quota_learn())
+        {
+            state.stats.learn_limit(name);
+        }
     }
     // §4.3: a context overflow says nothing about the backend's health — the
     // backend is fine, the prompt does not fit. Keep it out of the cooldown
@@ -288,7 +400,8 @@ pub fn outcome_for(err: &BackendError) -> Outcome {
         BackendError::Timeout(_) | BackendError::Spawn(_, _) | BackendError::Busy(_) => {
             Outcome::RetryableError
         }
-        BackendError::Http(_, 429 | 500..=599, _) => Outcome::RetryableError,
+        BackendError::RateLimited(..) => Outcome::RetryableError,
+        BackendError::Http(_, 500..=599, _) => Outcome::RetryableError,
         _ => Outcome::OtherError,
     }
 }
@@ -306,7 +419,11 @@ pub fn cooldown_for(err: &BackendError, failures: u32, cooldown_secs: u64) -> Du
         BackendError::Spawn(_, msg) if msg.to_ascii_lowercase().contains("refused") => {
             Duration::from_secs(5)
         }
-        // 429 / other HTTP: base cooldown (Retry-After not yet threaded through).
+        // P-9: honor the upstream's own Retry-After on a 429. It knows when its
+        // window resets and we do not; guessing cooldown_secs either benches a
+        // recovered backend or hammers one that is still refusing.
+        BackendError::RateLimited(_, Some(after), _) => *after,
+        // Other HTTP, and a 429 with no usable header: base cooldown.
         _ => Duration::from_secs(cooldown_secs),
     }
 }
@@ -339,9 +456,31 @@ mod tests {
             .as_secs(),
             5
         );
+        // P-9: a 429 with no usable Retry-After falls back to the base cooldown.
         assert_eq!(
-            cooldown_for(&BackendError::Http("t".into(), 429, String::new()), 1, 60).as_secs(),
+            cooldown_for(
+                &BackendError::RateLimited("t".into(), None, String::new()),
+                1,
+                60
+            )
+            .as_secs(),
             60
+        );
+        // ...and one that carries the header honors it instead of guessing. §12's
+        // forced-429 drill turns on exactly this: the leg returns to service when
+        // Retry-After elapses, not cooldown_secs later.
+        assert_eq!(
+            cooldown_for(
+                &BackendError::RateLimited(
+                    "t".into(),
+                    Some(Duration::from_secs(120)),
+                    String::new()
+                ),
+                1,
+                60
+            )
+            .as_secs(),
+            120
         );
     }
 
@@ -434,7 +573,7 @@ bin = "/bin/echo"
             Outcome::RetryableError
         );
         assert_eq!(
-            outcome_for(&BackendError::Http("a".into(), 429, String::new())),
+            outcome_for(&BackendError::RateLimited("a".into(), None, String::new())),
             Outcome::RetryableError
         );
         assert_eq!(

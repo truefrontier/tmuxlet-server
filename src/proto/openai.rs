@@ -99,6 +99,28 @@ pub fn last_user_text(messages: &[ChatMessage]) -> String {
         .unwrap_or_default()
 }
 
+/// Re-serialize a message list as the OpenAI wire shape, flattening multi-part
+/// content down to text.
+///
+/// §9.1 uses this so that a request arriving on the Anthropic surface reaches an
+/// `api` backend as an **OpenAI** body — those upstreams speak OpenAI, and
+/// forwarding Anthropic JSON to one would fail in a confusing way. It also means
+/// routing, signal extraction, and prompt shaping see one shape regardless of
+/// which endpoint the client used.
+pub fn messages_to_json(messages: &[ChatMessage]) -> serde_json::Value {
+    serde_json::Value::Array(
+        messages
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": m.role,
+                    "content": content_to_text(&m.content),
+                })
+            })
+            .collect(),
+    )
+}
+
 /// §4.2: the text of the *first* user message — the opening task. Paired with
 /// `last_user_text` to build the classifier input, because a conversation's
 /// intent lives at its start and the current ask lives at its end.
@@ -219,6 +241,75 @@ pub struct Delta {
 }
 
 /// V1 buffered streaming: role-prime, one content frame, final, then [DONE].
+/// One SSE frame from a chunk choice.
+fn chunk_frame(id: &str, model: &str, created: u64, c: ChunkChoice) -> String {
+    let chunk = ChatChunk {
+        id: id.into(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.into(),
+        choices: vec![c],
+    };
+    format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap())
+}
+
+/// §9.2: the role-priming frame, emitted once at the commit point of a real
+/// stream so the client sees a well-formed OpenAI stream rather than bare
+/// content deltas.
+pub fn stream_role_frame(id: &str, model: &str) -> String {
+    chunk_frame(
+        id,
+        model,
+        unix_now(),
+        ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: Some("assistant"),
+                content: Some(String::new()),
+            },
+            finish_reason: None,
+        },
+    )
+}
+
+/// §9.2: one relayed token (or run of tokens).
+pub fn stream_delta_frame(id: &str, model: &str, delta: &str) -> String {
+    chunk_frame(
+        id,
+        model,
+        unix_now(),
+        ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: None,
+                content: Some(delta.to_string()),
+            },
+            finish_reason: None,
+        },
+    )
+}
+
+/// §9.2: the finish frame plus `[DONE]`, for a stream whose deltas already went
+/// out live.
+pub fn stream_tail_frames(id: &str, model: &str) -> Vec<String> {
+    vec![
+        chunk_frame(
+            id,
+            model,
+            unix_now(),
+            ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    role: None,
+                    content: None,
+                },
+                finish_reason: Some("stop".into()),
+            },
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+}
+
 pub fn stream_frames(id: &str, model: &str, content: &str) -> Vec<String> {
     let created = unix_now();
     let frame = |c: ChunkChoice| {

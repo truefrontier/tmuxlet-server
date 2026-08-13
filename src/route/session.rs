@@ -84,6 +84,8 @@ pub struct StoredDecision {
     /// reusing, which is the difference between a useful rationale and "cached".
     pub source: DecisionSource,
     pub label: Option<String>,
+    /// §8: the chain, so a replayed decision finds the same gate.
+    pub chain: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +99,13 @@ pub struct SessionState {
     /// or resets its context it should send a *new* session id, which is cheaper
     /// and less surprising than us guessing when the prompt got shorter.
     pub excluded: HashSet<String>,
+    /// §8: consecutive judge escalations. Consecutive is load-bearing — a decline
+    /// resets it, and a judge *outage* holds it rather than clearing it, so an
+    /// outage can never manufacture a latch.
+    pub escalate_streak: u32,
+    /// §8: once the judge has confirmed, later turns skip both the cheap leg and
+    /// the judge. Names the leg that was escalated *past*.
+    pub latched: Option<String>,
     last_seen: Instant,
 }
 
@@ -105,6 +114,8 @@ impl SessionState {
         SessionState {
             decision: None,
             excluded: HashSet::new(),
+            escalate_streak: 0,
+            latched: None,
             last_seen: now,
         }
     }
@@ -266,6 +277,7 @@ mod tests {
                 legs: vec!["a".into(), "b".into()],
                 source: DecisionSource::Classifier,
                 label: Some("code/do-code".into()),
+                chain: Some("do-code".into()),
             });
         });
         let got = s.get(&k).unwrap().decision.unwrap();
@@ -317,6 +329,7 @@ mod tests {
                 legs: vec!["a".into()],
                 source: DecisionSource::Classifier,
                 label: None,
+                chain: None,
             });
         });
         // The stamp is set on write, so a 0s TTL means the very next read is past

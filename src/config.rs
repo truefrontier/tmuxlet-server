@@ -132,22 +132,94 @@ fn default_session_max() -> usize {
 fn default_session_ttl() -> u64 {
     7200
 }
+fn default_confirmations() -> u32 {
+    2
+}
+fn default_window_chars() -> usize {
+    500
+}
+fn default_router_type() -> String {
+    "classifier".into()
+}
+fn default_confidence_threshold() -> f64 {
+    0.5
+}
+fn default_reserve_threshold() -> f64 {
+    0.7
+}
+fn default_recent_turn_window() -> usize {
+    crate::route::signals::DEFAULT_RECENT_WINDOW
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Chain {
     pub order: Vec<String>,
+    /// §8: an acceptance gate for this chain. Absent means the V1 behavior —
+    /// advance only on failure or an empty reply.
+    #[serde(default)]
+    pub gate: Option<GateCfg>,
+}
+
+/// §8: `[chains.<name>.gate]`.
+#[derive(Debug, Deserialize)]
+pub struct GateCfg {
+    /// Only `"judge"` today. `non_empty` is always on and needs no config.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// A defined backend that rates the completed turn.
+    pub classifier: String,
+    /// Override the default judge prompt. `{input}` and `{output}` are
+    /// substituted.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Consecutive escalate verdicts before the chain actually advances. A single
+    /// judge opinion is noisy, and acting on it doubles the cost of every turn
+    /// the judge happens to dislike. Needs a session key to count past 1.
+    #[serde(default = "default_confirmations")]
+    pub confirmations: u32,
+    /// How much of the reply (tail) the judge sees.
+    #[serde(default = "default_window_chars")]
+    pub window_chars: usize,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Router {
-    /// A defined backend (not a router) that classifies the task.
-    pub classifier: String,
+    /// §7.6: `"classifier"` (default, the §5 auto-router) or `"signals"` (the
+    /// quota-aware scorer). Defaulting to `classifier` is what keeps every
+    /// existing `[routers.x]` table working untouched.
+    #[serde(rename = "type", default = "default_router_type")]
+    pub kind: String,
+    /// A defined backend (not a router) that classifies the task. Required for a
+    /// `classifier` router; optional for a `signals` one, which consults it only
+    /// on sub-threshold turns.
+    #[serde(default)]
+    pub classifier: Option<String>,
     #[serde(default = "default_classifier_timeout")]
     pub classifier_timeout_secs: u64,
     #[serde(default = "default_classifier_max_chars")]
     pub classifier_max_chars: usize,
     /// Class used when classification fails/times out/answers garbage.
-    pub fallback_class: String,
+    #[serde(default)]
+    pub fallback_class: Option<String>,
+    /// §7.6: the ordered chain a `signals` router rations over. Leg 0 is the
+    /// preferred (flat-rate) backend; rationing starts one leg deeper.
+    #[serde(default)]
+    pub chain: Option<String>,
+    /// §7.2: how decisive the score must be to move a turn. 0.5 is "about
+    /// one-and-a-half corroborating signals", which is what keeps a single noisy
+    /// signal from flipping a route.
+    #[serde(default = "default_confidence_threshold")]
+    pub confidence_threshold: f64,
+    /// §7.6: the quota pressure at which rationing begins. **1.0 means never
+    /// ration** — always leg 0, fall through only on an actual 429 — which is
+    /// today's behavior and, per §12, may well be correct.
+    #[serde(default = "default_reserve_threshold")]
+    pub reserve_threshold: f64,
+    /// §7.1: how many recent tool results the severity and op counts range over,
+    /// so an error persists through recovery turns instead of clearing the
+    /// instant one clean result lands.
+    #[serde(default = "default_recent_turn_window")]
+    pub recent_turn_window: usize,
     #[serde(default)]
     pub classifier_prompt: Option<String>,
     /// class -> chain or backend.
@@ -190,6 +262,26 @@ pub enum Backend {
         /// U-14: prompt shaping — "transcript" (default) | "last_user".
         #[serde(default)]
         prompt_mode: Option<String>,
+        /// §7.3: what a marginal call costs — subscription | local | free |
+        /// metered. Omit to take the per-type default (see `cost_class`).
+        #[serde(default)]
+        cost: Option<String>,
+        /// §7.6: this backend runs tools. A turn with tool history may only be
+        /// shed to an agentic leg — `codex` writing files is not substitutable by
+        /// a text-only model returning prose *about* writing files.
+        #[serde(default)]
+        agentic: Option<bool>,
+        /// §7.5 tier 2: known calls per quota window. Enables proactive pressure.
+        #[serde(default)]
+        quota_calls: Option<u32>,
+        /// §7.5: the window `quota_calls` applies to. Defaults to one hour.
+        #[serde(default)]
+        quota_window_secs: Option<u64>,
+        /// §7.5 tier 3: record `calls_in_window` at the first 429 and carry it as
+        /// the next window's limit. Costs one failed leg per window to discover,
+        /// and is the only option that works when the provider's limit is opaque.
+        #[serde(default)]
+        quota_learn: bool,
     },
     Api {
         base_url: String,
@@ -209,6 +301,26 @@ pub enum Backend {
         /// TLS in addition to the webpki roots.
         #[serde(default)]
         ca_file: Option<String>,
+        /// §7.3: what a marginal call costs — subscription | local | free |
+        /// metered. Omit to take the per-type default (see `cost_class`).
+        #[serde(default)]
+        cost: Option<String>,
+        /// §7.6: this backend runs tools. A turn with tool history may only be
+        /// shed to an agentic leg — `codex` writing files is not substitutable by
+        /// a text-only model returning prose *about* writing files.
+        #[serde(default)]
+        agentic: Option<bool>,
+        /// §7.5 tier 2: known calls per quota window. Enables proactive pressure.
+        #[serde(default)]
+        quota_calls: Option<u32>,
+        /// §7.5: the window `quota_calls` applies to. Defaults to one hour.
+        #[serde(default)]
+        quota_window_secs: Option<u64>,
+        /// §7.5 tier 3: record `calls_in_window` at the first 429 and carry it as
+        /// the next window's limit. Costs one failed leg per window to discover,
+        /// and is the only option that works when the provider's limit is opaque.
+        #[serde(default)]
+        quota_learn: bool,
     },
     Cli {
         bin: String,
@@ -239,8 +351,45 @@ pub enum Backend {
         /// U-14: prompt shaping — "transcript" (default) | "last_user".
         #[serde(default)]
         prompt_mode: Option<String>,
+        /// §7.3: what a marginal call costs — subscription | local | free |
+        /// metered. Omit to take the per-type default (see `cost_class`).
+        #[serde(default)]
+        cost: Option<String>,
+        /// §7.6: this backend runs tools. A turn with tool history may only be
+        /// shed to an agentic leg — `codex` writing files is not substitutable by
+        /// a text-only model returning prose *about* writing files.
+        #[serde(default)]
+        agentic: Option<bool>,
+        /// §7.5 tier 2: known calls per quota window. Enables proactive pressure.
+        #[serde(default)]
+        quota_calls: Option<u32>,
+        /// §7.5: the window `quota_calls` applies to. Defaults to one hour.
+        #[serde(default)]
+        quota_window_secs: Option<u64>,
+        /// §7.5 tier 3: record `calls_in_window` at the first 429 and carry it as
+        /// the next window's limit. Costs one failed leg per window to discover,
+        /// and is the only option that works when the provider's limit is opaque.
+        #[serde(default)]
+        quota_learn: bool,
     },
 }
+
+/// §7.3-7.5, borrowed out of whichever `Backend` variant this is.
+struct Econ<'a> {
+    cost: Option<&'a str>,
+    agentic: Option<bool>,
+    quota_calls: Option<u32>,
+    quota_window_secs: Option<u64>,
+    quota_learn: bool,
+}
+
+/// §7.4. `subscription` is free until the quota wall then effectively infinite;
+/// `local` is bounded by your hardware; `free` is a subscription with an unknown
+/// quota; `metered` is linear dollars and is the shed target.
+pub const COST_CLASSES: &[&str] = &["subscription", "local", "free", "metered"];
+
+/// §7.6. `classifier` is the §5 auto-router; `signals` is the quota-aware scorer.
+pub const ROUTER_TYPES: &[&str] = &["classifier", "signals"];
 
 impl Backend {
     /// The `type` discriminant as it appears in config and on `/v1/backends`.
@@ -253,6 +402,73 @@ impl Backend {
         }
     }
 
+    /// The `cost`/`agentic`/`quota_*` block, whichever variant this is. Written
+    /// once here rather than matched at every call site, because the economics
+    /// are deliberately identical across the three backend types — only the
+    /// defaults differ.
+    fn econ(&self) -> Econ<'_> {
+        match self {
+            Backend::Tmuxlet {
+                cost,
+                agentic,
+                quota_calls,
+                quota_window_secs,
+                quota_learn,
+                ..
+            }
+            | Backend::Api {
+                cost,
+                agentic,
+                quota_calls,
+                quota_window_secs,
+                quota_learn,
+                ..
+            }
+            | Backend::Cli {
+                cost,
+                agentic,
+                quota_calls,
+                quota_window_secs,
+                quota_learn,
+                ..
+            } => Econ {
+                cost: cost.as_deref(),
+                agentic: *agentic,
+                quota_calls: *quota_calls,
+                quota_window_secs: *quota_window_secs,
+                quota_learn: *quota_learn,
+            },
+        }
+    }
+
+    /// §7.6: does this backend run tools?
+    ///
+    /// Defaults are conservative in the direction that matters: shedding a
+    /// tool-running turn to a text-only leg makes the request "succeed" and
+    /// return the wrong kind of artifact entirely, which is not recoverable —
+    /// spending quota you meant to save is. So the process backends default to
+    /// agentic and only `api` defaults to text-only.
+    pub fn is_agentic(&self) -> bool {
+        self.econ()
+            .agentic
+            .unwrap_or(!matches!(self, Backend::Api { .. }))
+    }
+
+    /// §7.5 tier 2: configured calls per window, if the operator knows the limit.
+    pub fn quota_calls(&self) -> Option<u32> {
+        self.econ().quota_calls
+    }
+
+    /// §7.5: the window `quota_calls` applies to.
+    pub fn quota_window_secs(&self) -> Option<u64> {
+        self.econ().quota_window_secs
+    }
+
+    /// §7.5 tier 3: learn the limit from where the last 429 landed.
+    pub fn quota_learn(&self) -> bool {
+        self.econ().quota_learn
+    }
+
     /// §7.3: what a marginal call to this backend actually costs, which is not
     /// the same question as how capable it is.
     ///
@@ -263,11 +479,22 @@ impl Backend {
     /// most existing configs need no edit; Phase 3 adds a per-backend `cost` key
     /// that overrides them.
     pub fn cost_class(&self) -> &'static str {
+        if let Some(c) = self.econ().cost
+            && let Some(known) = COST_CLASSES.iter().find(|k| **k == c)
+        {
+            return known;
+        }
         match self {
             Backend::Tmuxlet { .. } => "subscription",
             Backend::Api { .. } => "metered",
             Backend::Cli { .. } => "local",
         }
+    }
+
+    /// The `cost` string exactly as written, for validation. `None` means the
+    /// operator did not set one and `cost_class` supplies the per-type default.
+    pub fn declared_cost(&self) -> Option<&str> {
+        self.econ().cost
     }
 }
 
@@ -337,13 +564,47 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
                 "router '{rname}' collides with a chain or backend name — rename one"
             ));
         }
-        if !cfg.backends.contains_key(&r.classifier) {
+        if !ROUTER_TYPES.contains(&r.kind.as_str()) {
             return Err(format!(
-                "router '{rname}' classifier '{}' is not a defined backend",
-                r.classifier
+                "router '{rname}' type '{}' is unknown — use one of: {}",
+                r.kind,
+                ROUTER_TYPES.join(", ")
             ));
         }
-        if r.routes.is_empty() {
+        let signals = r.kind == "signals";
+        if let Some(c) = &r.classifier
+            && !cfg.backends.contains_key(c)
+        {
+            return Err(format!(
+                "router '{rname}' classifier '{c}' is not a defined backend"
+            ));
+        }
+        if !signals && r.classifier.is_none() {
+            return Err(format!(
+                "router '{rname}' has no classifier — a type = \"classifier\" router needs one, or set type = \"signals\""
+            ));
+        }
+        // §7.6: a signals router rations over one ordered chain. Leg 0 is the
+        // preferred backend, so the chain IS the cost preference.
+        match (&r.chain, signals) {
+            (None, true) => {
+                return Err(format!(
+                    "router '{rname}' is type = \"signals\" but has no chain — it needs an ordered chain to ration over"
+                ));
+            }
+            (Some(ch), _) => {
+                if !cfg.chains.contains_key(ch) && !cfg.backends.contains_key(ch) {
+                    return Err(format!(
+                        "router '{rname}' chain '{ch}' is not a defined chain or backend"
+                    ));
+                }
+            }
+            (None, false) => {}
+        }
+        // A classifier router routes classes; a signals router only does so when
+        // a classifier is configured for its sub-threshold turns.
+        let needs_routes = !signals || r.classifier.is_some();
+        if needs_routes && r.routes.is_empty() {
             return Err(format!("router '{rname}' has no [routers.{rname}.routes]"));
         }
         for (class, target) in &r.routes {
@@ -353,10 +614,66 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
                 ));
             }
         }
-        if !r.routes.contains_key(&r.fallback_class) {
+        match &r.fallback_class {
+            Some(fc) if !r.routes.contains_key(fc) => {
+                return Err(format!(
+                    "router '{rname}' fallback_class '{fc}' is not one of its routes"
+                ));
+            }
+            None if needs_routes => {
+                return Err(format!(
+                    "router '{rname}' has no fallback_class — name the class to use when classification fails"
+                ));
+            }
+            _ => {}
+        }
+        for (key, v) in [
+            ("confidence_threshold", r.confidence_threshold),
+            ("reserve_threshold", r.reserve_threshold),
+        ] {
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!("router '{rname}' {key} = {v} is outside 0.0..=1.0"));
+            }
+        }
+        if r.recent_turn_window == 0 {
             return Err(format!(
-                "router '{rname}' fallback_class '{}' is not one of its routes",
-                r.fallback_class
+                "router '{rname}' recent_turn_window = 0 would blind the scorer; use 1 or more"
+            ));
+        }
+    }
+    // §8: a gate that names a missing judge, or a type we do not implement, is a
+    // config that would silently never gate.
+    for (cname, chain) in &cfg.chains {
+        let Some(g) = &chain.gate else { continue };
+        if !GATE_TYPES.contains(&g.kind.as_str()) {
+            return Err(format!(
+                "chain '{cname}' gate type '{}' is unknown — use one of: {}",
+                g.kind,
+                GATE_TYPES.join(", ")
+            ));
+        }
+        if !cfg.backends.contains_key(&g.classifier) {
+            return Err(format!(
+                "chain '{cname}' gate classifier '{}' is not a defined backend",
+                g.classifier
+            ));
+        }
+        if chain.order.len() < 2 {
+            return Err(format!(
+                "chain '{cname}' has a gate but only {} leg(s) — a gate that rejects has nowhere to advance to",
+                chain.order.len()
+            ));
+        }
+    }
+    // §7.3: a cost class we do not know is a typo, and a typo here silently
+    // changes which backend rationing protects.
+    for (bname, b) in &cfg.backends {
+        if let Some(c) = b.declared_cost()
+            && !COST_CLASSES.contains(&c)
+        {
+            return Err(format!(
+                "backend '{bname}' cost '{c}' is unknown — use one of: {}",
+                COST_CLASSES.join(", ")
             ));
         }
     }
@@ -521,7 +838,16 @@ const SERVER_KEYS: &[&str] = &[
     "session_max",
     "session_ttl_secs",
 ];
-const CHAIN_KEYS: &[&str] = &["order"];
+const CHAIN_KEYS: &[&str] = &["order", "gate"];
+const GATE_KEYS: &[&str] = &[
+    "type",
+    "classifier",
+    "prompt",
+    "confirmations",
+    "window_chars",
+];
+/// §8: the only gate type with configuration. `non_empty` is unconditional.
+pub const GATE_TYPES: &[&str] = &["judge"];
 const TMUXLET_KEYS: &[&str] = &[
     "type",
     "target",
@@ -531,6 +857,11 @@ const TMUXLET_KEYS: &[&str] = &[
     "env_pass",
     "max_concurrent",
     "prompt_mode",
+    "cost",
+    "agentic",
+    "quota_calls",
+    "quota_window_secs",
+    "quota_learn",
 ];
 const API_KEYS: &[&str] = &[
     "type",
@@ -542,6 +873,11 @@ const API_KEYS: &[&str] = &[
     "allow_empty",
     "max_concurrent",
     "ca_file",
+    "cost",
+    "agentic",
+    "quota_calls",
+    "quota_window_secs",
+    "quota_learn",
 ];
 const CLI_KEYS: &[&str] = &[
     "type",
@@ -555,8 +891,18 @@ const CLI_KEYS: &[&str] = &[
     "stdin_prompt",
     "max_concurrent",
     "prompt_mode",
+    "cost",
+    "agentic",
+    "quota_calls",
+    "quota_window_secs",
+    "quota_learn",
 ];
 const ROUTER_KEYS: &[&str] = &[
+    "type",
+    "chain",
+    "confidence_threshold",
+    "reserve_threshold",
+    "recent_turn_window",
     "classifier",
     "classifier_timeout_secs",
     "classifier_max_chars",
@@ -591,9 +937,23 @@ fn unknown_keys(text: &str) -> Vec<(String, Option<String>)> {
     if let Some(Value::Table(chains)) = table.get("chains") {
         for (cname, cval) in chains {
             if let Value::Table(c) = cval {
-                for (k, _) in c {
+                for (k, v) in c {
                     if !CHAIN_KEYS.contains(&k.as_str()) {
                         out.push((format!("chains.{cname}.{k}"), nearest(k, CHAIN_KEYS)));
+                    }
+                    // §8: the gate sub-table gets the same unknown-key treatment,
+                    // or a typo'd `confirmation` silently means "1".
+                    if k == "gate"
+                        && let Value::Table(g) = v
+                    {
+                        for (gk, _) in g {
+                            if !GATE_KEYS.contains(&gk.as_str()) {
+                                out.push((
+                                    format!("chains.{cname}.gate.{gk}"),
+                                    nearest(gk, GATE_KEYS),
+                                ));
+                            }
+                        }
                     }
                 }
             }

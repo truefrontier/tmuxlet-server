@@ -178,7 +178,21 @@ fn read_body<R: Read>(r: &mut R, buf: &mut Vec<u8>, max_bytes: usize) -> io::Res
     }
 }
 
-fn parse_response(raw: &[u8]) -> io::Result<(u16, String)> {
+/// §7.5 / P-9: seconds from a `Retry-After` header.
+///
+/// Only the delta-seconds form is honored. The HTTP-date form is legal but rare
+/// from LLM upstreams, and parsing RFC 7231 dates by hand — with no chrono in the
+/// dependency budget — is more ways to be wrong than it is worth. An unparseable
+/// value falls back to `cooldown_secs`, which is what happens today anyway.
+fn parse_retry_after(head: &str) -> Option<u64> {
+    head.lines().find_map(|l| {
+        let low = l.to_ascii_lowercase();
+        low.strip_prefix("retry-after:")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+fn parse_response(raw: &[u8]) -> io::Result<(u16, String, Option<u64>)> {
     let sep = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -200,7 +214,7 @@ fn parse_response(raw: &[u8]) -> io::Result<(u16, String)> {
     } else {
         String::from_utf8_lossy(body_bytes).into_owned()
     };
-    Ok((status, body))
+    Ok((status, body, parse_retry_after(&head)))
 }
 
 /// Decode an HTTP/1.1 `Transfer-Encoding: chunked` body. Lenient: stops at the
@@ -225,6 +239,173 @@ fn dechunk(mut data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// §9.2: POST and relay the response body to `on_chunk` as it arrives.
+///
+/// The status line and headers are read first, so a non-2xx upstream is returned
+/// whole and **`on_chunk` is never called** — which is exactly what keeps chain
+/// fallback available: nothing has been written to the client, so the chain can
+/// still advance. Once `on_chunk` fires we are committed to this backend, because
+/// there is no way to un-send a `data:` frame.
+///
+/// `on_chunk` returns false to stop (client gone). Returns the status and, for a
+/// non-2xx, the buffered error body.
+#[allow(clippy::too_many_arguments)]
+pub fn post_json_stream(
+    scheme: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    bearer: Option<&str>,
+    body: &str,
+    timeout: Duration,
+    max_bytes: usize,
+    ca_file: Option<&Path>,
+    on_chunk: &mut dyn FnMut(&[u8]) -> bool,
+) -> io::Result<(u16, String, Option<u64>)> {
+    let req = request_bytes(host, port, path, bearer, body);
+    let tcp = connect(host, port, timeout)?;
+    if scheme == "https" {
+        let name = ServerName::try_from(host.to_string())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let conn =
+            ClientConnection::new(tls_config_for(ca_file)?, name).map_err(io::Error::other)?;
+        let mut tls = StreamOwned::new(conn, tcp);
+        tls.write_all(req.as_bytes())?;
+        tls.flush()?;
+        stream_body(&mut tls, max_bytes, on_chunk)
+    } else {
+        let mut sock = tcp;
+        sock.write_all(req.as_bytes())?;
+        sock.flush()?;
+        stream_body(&mut sock, max_bytes, on_chunk)
+    }
+}
+
+/// Read headers, then relay body bytes. `Transfer-Encoding: chunked` is decoded
+/// incrementally; anything else is relayed verbatim.
+fn stream_body<R: Read>(
+    r: &mut R,
+    max_bytes: usize,
+    on_chunk: &mut dyn FnMut(&[u8]) -> bool,
+) -> io::Result<(u16, String, Option<u64>)> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut head_len: Option<usize> = None;
+    let mut status = 0u16;
+    let mut retry_after = None;
+    let mut chunked = false;
+    let mut relayed = 0usize;
+    let mut pending = Vec::new();
+    loop {
+        let n = match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // Same unclean-close tolerance as read_body: a peer that drops the
+            // socket after the body is complete is not an error.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        };
+        if head_len.is_none() {
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                if max_bytes > 0 && buf.len() > max_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::FileTooLarge,
+                        "response headers exceed the cap",
+                    ));
+                }
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
+            status = head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad status line"))?;
+            retry_after = parse_retry_after(&head);
+            chunked = head.lines().any(|l| {
+                let l = l.to_ascii_lowercase();
+                l.starts_with("transfer-encoding:") && l.contains("chunked")
+            });
+            head_len = Some(pos + 4);
+            pending = buf[pos + 4..].to_vec();
+            buf.truncate(pos + 4);
+        } else {
+            pending.extend_from_slice(&chunk[..n]);
+        }
+        // A non-2xx is buffered whole and returned; the caller falls through to
+        // the next leg with nothing written.
+        if !(200..300).contains(&status) {
+            if max_bytes > 0 && pending.len() > max_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "error body exceeds the cap",
+                ));
+            }
+            continue;
+        }
+        let out = if chunked {
+            take_chunks(&mut pending)
+        } else {
+            std::mem::take(&mut pending)
+        };
+        if out.is_empty() {
+            continue;
+        }
+        relayed = relayed.saturating_add(out.len());
+        if max_bytes > 0 && relayed > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "streamed body exceeds the cap",
+            ));
+        }
+        if !on_chunk(&out) {
+            break;
+        }
+    }
+    if !(200..300).contains(&status) {
+        let body = if chunked {
+            String::from_utf8_lossy(&dechunk(&pending)).into_owned()
+        } else {
+            String::from_utf8_lossy(&pending).into_owned()
+        };
+        return Ok((status, body, retry_after));
+    }
+    Ok((status, String::new(), retry_after))
+}
+
+/// Pull every COMPLETE chunk out of `data`, leaving any partial tail behind for
+/// the next read. Returns the decoded bytes.
+fn take_chunks(data: &mut Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut consumed = 0usize;
+    loop {
+        let rest = &data[consumed..];
+        let Some(nl) = rest.windows(2).position(|w| w == b"\r\n") else {
+            break;
+        };
+        let size_line = &rest[..nl];
+        let hex = String::from_utf8_lossy(size_line);
+        let Ok(size) = usize::from_str_radix(hex.trim().split(';').next().unwrap_or("").trim(), 16)
+        else {
+            break;
+        };
+        let start = nl + 2;
+        // +2 for the CRLF that terminates the chunk data.
+        if rest.len() < start + size + 2 {
+            break; // partial chunk; wait for more
+        }
+        out.extend_from_slice(&rest[start..start + size]);
+        consumed += start + size + 2;
+        if size == 0 {
+            break;
+        }
+    }
+    data.drain(..consumed);
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn post_json(
     scheme: &str,
@@ -236,7 +417,7 @@ pub fn post_json(
     timeout: Duration,
     max_bytes: usize,
     ca_file: Option<&Path>,
-) -> io::Result<(u16, String)> {
+) -> io::Result<(u16, String, Option<u64>)> {
     let req = request_bytes(host, port, path, bearer, body);
     let mut raw = Vec::new();
     let tcp = connect(host, port, timeout)?;
@@ -275,7 +456,7 @@ mod tests {
     #[test]
     fn parses_status_and_body() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\n{\"ok\":1}";
-        let (status, body) = parse_response(raw).unwrap();
+        let (status, body, _retry) = parse_response(raw).unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, "{\"ok\":1}");
     }
@@ -283,7 +464,7 @@ mod tests {
     #[test]
     fn dechunks_chunked_response() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        let (status, body) = parse_response(raw).unwrap();
+        let (status, body, _retry) = parse_response(raw).unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, "hello world");
     }
@@ -304,7 +485,7 @@ mod tests {
         let mut cursor: &[u8] = raw;
         let mut buf = Vec::new();
         read_body(&mut cursor, &mut buf, 0).unwrap();
-        let (status, body) = parse_response(&buf).unwrap();
+        let (status, body, _retry) = parse_response(&buf).unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, "hello");
     }
@@ -332,7 +513,7 @@ mod tests {
         let mut cursor: &[u8] = raw.as_bytes();
         let mut buf = Vec::new();
         read_body(&mut cursor, &mut buf, 0).unwrap();
-        let (status, body) = parse_response(&buf).unwrap();
+        let (status, body, _retry) = parse_response(&buf).unwrap();
         assert_eq!(status, 200);
         assert_eq!(body, "{\"ok\":1}");
     }

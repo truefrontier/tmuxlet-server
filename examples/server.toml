@@ -93,6 +93,22 @@ order = ["claude-thinking", "agy"]
 # All backend types:
 #   allow_empty = false             # U-6: accept an empty completion as success
 #   max_concurrent = 1              # U-20: cap simultaneous dispatches (saturated → Busy → next leg)
+#   cost = "subscription"           # §7.3: subscription | local | free | metered.
+#                                   #   Defaults per type: tmuxlet=subscription,
+#                                   #   cli=local, api=metered — so most configs
+#                                   #   need no edit. Only `metered` costs money at
+#                                   #   the margin; rationing exists to protect you
+#                                   #   from it.
+#   agentic = true                  # §7.6: this backend runs tools. A turn with tool
+#                                   #   history is NEVER shed to a non-agentic leg —
+#                                   #   prose *about* editing a file is not an edit.
+#                                   #   Defaults true for tmuxlet/cli, false for api.
+#   quota_calls = 200               # §7.5: known calls per window (proactive pressure)
+#   quota_window_secs = 3600        # §7.5: the window quota_calls applies to
+#   quota_learn = false             # §7.5: learn the limit from where a 429 lands.
+#                                   #   Costs one failed leg per window to discover,
+#                                   #   and is the only thing that works when the
+#                                   #   provider's limit is opaque.
 #
 # type = "tmuxlet":
 #   target_args = ["--effort", "max"]   # passed through as repeated --target-arg
@@ -137,6 +153,55 @@ order = ["claude-thinking", "agy"]
 #   [routers.smart.routes]          # class -> chain or backend
 #   research = "thinking"
 #   execution = "default"
+#
+# ── [chains.<name>.gate] — §8 acceptance gates ───────────────────────────────
+# A chain normally advances only when a leg FAILS or returns empty, so a
+# confidently wrong answer from a cheap model wins and is served. A judge gate
+# rates the completed turn and advances on a bad one.
+#
+# [chains.improve-general]
+# order = ["gemini-flash", "gpt-oss", "or-sonnet"]
+#
+# [chains.improve-general.gate]
+#   type = "judge"
+#   classifier = "gemini-flash"     # a defined backend that rates the turn
+#   confirmations = 2               # consecutive escalate verdicts before advancing.
+#                                   #   One judge opinion is noisy, and acting on it
+#                                   #   doubles the cost of every turn it dislikes.
+#                                   #   Needs a session header to count past 1;
+#                                   #   without one it degrades to 1 and warns.
+#   window_chars = 500              # how much of the reply (tail) the judge sees
+#   # prompt = "..."                # override; {input} and {output} are substituted
+#
+# Cost: a declined turn costs cheap-leg + judge. A confirming turn costs
+# cheap-leg + judge + expensive-leg. On confirmation the session latches, so
+# later turns skip both the cheap leg and the judge. A judge outage fails OPEN —
+# it serves the buffered reply and holds the streak rather than clearing it, so
+# an outage can never manufacture a latch.
+
+# ── [routers.<name>] type = "signals" — §7 quota-aware routing ───────────────
+# Routes by reading the conversation's tool history instead of paying an LLM
+# round-trip. The scorer is a RANKER, not a decider: quota pressure sets how many
+# turns get the flat-rate backend, and the score only chooses which ones — and
+# only once headroom is actually scarce.
+#
+# [routers.do]
+#   type = "signals"
+#   chain = "do-general"            # ordered chain; leg 0 is the preferred backend
+#   confidence_threshold = 0.5      # §7.2: how decisive the score must be to act.
+#                                   #   0.5 ≈ "one-and-a-half corroborating signals",
+#                                   #   which keeps one noisy signal from flipping a
+#                                   #   route (one maxed signal scores 0.462).
+#   reserve_threshold = 0.7         # §7.6: quota pressure at which rationing begins.
+#                                   #   1.0 = never ration (today's behavior, and the
+#                                   #   §12 null hypothesis). Below the threshold the
+#                                   #   whole cascade is one comparison and a return.
+#   recent_turn_window = 3          # §7.1: how many recent tool results count
+#   classifier = "gemini-flash"     # optional: consulted ONLY on sub-threshold turns
+#   fallback_class = "general"      #   (needs [routers.do.routes] as well)
+#
+# A signals router needs real tool traffic. A plain chat client (curl, a bare
+# completion) has no tool history, scores 0.0, and lands on leg 0 every time.
 #
 # Observability: the response carries `x-tmuxlet-route: class/chain/backend`, and
 # GET /v1/backends shows per-backend health (state ok|cooling|busy|unknown).

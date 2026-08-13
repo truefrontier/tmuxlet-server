@@ -1,11 +1,13 @@
 //! Wire protocols the server speaks, plus the request shaping that is common to
 //! all of them.
 //!
-//! `openai` holds the `/v1/chat/completions` request and response shapes. Phase 5
-//! adds `anthropic` beside it. `PromptMode` lives here rather than in either one
+//! `openai` holds the `/v1/chat/completions` request and response shapes;
+//! `anthropic` holds the text-only `/v1/messages` surface. `PromptMode` lives
+//! here rather than in either one
 //! because it describes how a parsed conversation is flattened for a *backend* —
 //! that is a property of the backend, not of the protocol the client used.
 
+pub mod anthropic;
 pub mod openai;
 
 /// U-14: how a backend shapes the request into a single prompt string.

@@ -22,6 +22,12 @@ pub enum BackendError {
     Backend(String, String),
     /// name, status code, and the first chars of the upstream error body (U-7).
     Http(String, u16, String),
+    /// §7.5 / P-9: HTTP 429. Split out from `Http` because the upstream's
+    /// `Retry-After` is the **load-bearing quota signal** — it is what makes
+    /// backing off for the window the provider named, rather than a fixed
+    /// `cooldown_secs` guess, possible at all. `None` means the upstream sent no
+    /// usable header.
+    RateLimited(String, Option<Duration>, String),
     Parse(String, String),
     /// U-20: backend at its max_concurrent cap; the chain advances.
     Busy(String),
@@ -46,6 +52,17 @@ impl fmt::Display for BackendError {
                     write!(f, "[{n}] HTTP {s}: {d}")
                 }
             }
+            BackendError::RateLimited(n, after, d) => {
+                let when = match after {
+                    Some(a) => format!(" (retry after {}s)", a.as_secs()),
+                    None => String::new(),
+                };
+                if d.is_empty() {
+                    write!(f, "[{n}] HTTP 429{when}")
+                } else {
+                    write!(f, "[{n}] HTTP 429{when}: {d}")
+                }
+            }
             BackendError::Parse(n, m) => write!(f, "[{n}] parse error: {m}"),
             BackendError::Busy(n) => write!(f, "[{n}] busy (max_concurrent reached)"),
             BackendError::Overflow(n, d) => {
@@ -68,6 +85,7 @@ impl BackendError {
             | BackendError::Exit(n, _, _)
             | BackendError::Backend(n, _)
             | BackendError::Http(n, _, _)
+            | BackendError::RateLimited(n, _, _)
             | BackendError::Parse(n, _)
             | BackendError::Busy(n)
             | BackendError::Overflow(n, _) => n,
@@ -85,6 +103,7 @@ impl BackendError {
                 429 => "rate limited",
                 _ => "http error",
             },
+            BackendError::RateLimited(_, _, _) => "rate limited",
             BackendError::Parse(_, _) => "parse error",
             BackendError::Busy(_) => "busy",
             BackendError::Overflow(_, _) => "context overflow",
@@ -258,6 +277,9 @@ impl Backend {
                 env_pass,
                 max_concurrent,
                 prompt_mode,
+                // §7.3-7.5 economics are read from config by the router, not
+                // baked into the runtime backend.
+                ..
             } => Backend::Tmuxlet(TmuxletBackend {
                 name: name.into(),
                 bin: resolve_program("tmuxlet", env),
@@ -282,6 +304,7 @@ impl Backend {
                 allow_empty,
                 max_concurrent,
                 ca_file,
+                ..
             } => Backend::Api(ApiBackend {
                 name: name.into(),
                 base_url: base_url.clone(),
@@ -305,6 +328,7 @@ impl Backend {
                 stdin_prompt,
                 max_concurrent,
                 prompt_mode,
+                ..
             } => Backend::Cli(CliBackend {
                 name: name.into(),
                 bin: PathBuf::from(bin),
@@ -366,6 +390,34 @@ impl Backend {
     }
 
     /// U-14: prompt shaping mode (api backends pass raw JSON, so Transcript).
+    /// §9.2: true only for `api`. `tmuxlet`/`cli` are structurally blocking — the
+    /// child emits at exit, and a PTY's intermediate output is TUI redraw, not
+    /// tokens. That is permanent, not a gap.
+    pub fn supports_streaming(&self) -> bool {
+        matches!(self, Backend::Api(_))
+    }
+
+    /// Dispatch with real upstream streaming, relaying deltas to `on_delta`.
+    /// Only meaningful when `supports_streaming()`; anything else falls back to a
+    /// normal blocking dispatch and emits its whole reply as one delta.
+    pub fn dispatch_stream(
+        &self,
+        prompt: &str,
+        raw_messages: &serde_json::Value,
+        env: &Env,
+        timeout: Duration,
+        on_delta: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<DispatchResult, BackendError> {
+        match self {
+            Backend::Api(b) => api::dispatch_stream(b, raw_messages, env, timeout, on_delta),
+            _ => {
+                let r = self.dispatch(prompt, raw_messages, env, timeout)?;
+                on_delta(&r.content);
+                Ok(r)
+            }
+        }
+    }
+
     pub fn prompt_mode(&self) -> crate::proto::PromptMode {
         match self {
             Backend::Tmuxlet(b) => b.prompt_mode,

@@ -136,15 +136,77 @@ dropped a double prompt-substitution in the CLI path. E5 (allocation micro-churn
 and E7 (HEAD `Content-Length` / `WWW-Authenticate` RFC niceties) were left as the
 plan advised.
 
-## Deferred to V2 (by spec, not bugs)
+## V2 — the routing architecture (all seven phases)
 
-- **True token streaming passthrough** (supersedes the current buffered SSE, which
-  completes the upstream call then re-emits frames with 15s keepalives).
-- **P-7 client-disconnect detection + cancel propagation** to the backend child
-  (folds into the streaming work).
-- **U-22 SIGHUP config reload** and **P-4 HTTP connection reuse.**
-- **P-9 `Retry-After`** is not yet honored for 429 (uses `cooldown_secs`);
-  documented in `cooldown_for`.
+Implements [`docs/specs/2026-08-11-v2-routing-architecture.md`](specs/2026-08-11-v2-routing-architecture.md).
+Test count 129 → 317. Still zero new runtime dependencies: the only Cargo change
+is enabling `nix`'s `signal` feature, on a crate already in the tree.
+
+- **Phase 0 — correctness.** `parse_class` was nondeterministic under ambiguity
+  (two passes over a `HashMap`'s keys, so a reply naming two classes picked a
+  winner that varied between runs). The classifier was shown the latest user
+  message alone, which on turn 12 of an agent run is "yes, continue" — it now
+  sees the opening task too (60/40, opt out with `classifier_include_opening`).
+  A context overflow no longer cools a healthy backend, and an all-overflow chain
+  returns 400 `context_length_exceeded` instead of a 503 that invites a retry.
+- **Phase 1 — the decision layer.** `src/http.rs` split into `proto/`, `route/`,
+  `exec/` and `stats.rs`. Routing produces a `Decision` via a `Policy` chosen at
+  startup, and every response carries `x-tmuxlet-route` / `-backend` /
+  `-decision` / `-rationale`. New `/v1/stats`, `/v1/stats/reset` and (opt-in)
+  `/metrics`.
+- **Phase 2 — sessions.** Affinity off four recognized session headers replays
+  the first turn's decision and skips the classifier entirely; overflow
+  exclusions accumulate per conversation. The store is bounded both ways
+  (`session_max`, `session_ttl_secs`) because a client-supplied header keying an
+  unbounded map is a memory-exhaustion vector.
+- **Phase 3 — the signal router.** `type = "signals"` routes on tool history with
+  no LLM call. Cost is declared per backend (`subscription`/`local`/`free`/
+  `metered`) because our flagship backends are flat-rate: the scarce resource is
+  quota, not dollars, so the scorer is a ranker and `reserve_threshold` decides
+  how much it gets to rank. A tool-running turn is never shed to a non-agentic
+  leg. `signals.rs`/`scorer.rs` are derived from NVIDIA-NeMo/Switchyard — see
+  [`NOTICE`](../NOTICE).
+- **Phase 4 — acceptance gates.** `[chains.x.gate] type = "judge"` rates the
+  completed turn; N consecutive escalations advance the chain and latch the
+  session. A judge outage fails open and *holds* the streak, so an outage can
+  never manufacture a latch.
+- **Phase 5 — protocol surface.** Real token streaming for `api` backends, with
+  first-token success as the commit point (a failure before it still falls
+  through the chain). Text-only `/v1/messages`; a request carrying `tools` is
+  refused with a 400 that names the limitation rather than returning prose where
+  the caller expected a tool call.
+- **Phase 6 — operations.** `schema_version` (absent means 1, forever),
+  `--dry-run`, `--explain <model>`, `--replay <corpus.jsonl>` (§12's calibration
+  harness), SIGHUP reload that preserves counters and sessions and refuses a bad
+  config rather than bricking a running service, and `Retry-After` honored on 429.
+
+### Known limits, stated rather than hidden
+
+- **Overflow detection is `api`-only.** It keys on an HTTP 400, and only `api`
+  backends produce a status; a `tmuxlet` or `cli` backend that overflows still
+  cools as before.
+- **Streaming is `api`-only, permanently.** `tmuxlet`/`cli` are structurally
+  blocking — the child emits at exit, and a PTY's intermediate output is TUI
+  redraw, not tokens. The Anthropic surface always buffers, because its event
+  sequence cannot be re-shaped from a relayed OpenAI stream.
+- **A signals router needs real tool traffic.** A plain chat client scores 0.0 and
+  lands on leg 0 every time. `turn_depth` is a message-count proxy and is
+  wire-format dependent.
+- **Rationing is only as good as the quota estimate.** With no configured or
+  learned limit the router is purely reactive: it finds the wall by hitting it.
+  Still strictly better than V1, which hit the same wall *and* cooled a healthy
+  backend for `cooldown_secs`.
+- **Quota and session state are process-local** and die on restart.
+- **The §12 replay harness reports the routing split, not the four quadrants.**
+  Populating RESCUE/LOSS/SAFE/HARD needs conversations actually run both ways;
+  see [`docs/replay.md`](replay.md).
+
+## Deferred (by spec, not bugs)
+
+- **P-7 client-disconnect cancel propagation** to the backend child. A dead
+  socket is now detected on the streaming path (the send fails and the request is
+  counted), but the child is not killed.
+- **P-4 HTTP connection reuse.**
 
 ## Next steps (suggested)
 

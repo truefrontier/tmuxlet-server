@@ -5,9 +5,10 @@
 //! shared [`StaticPolicy`].
 
 use super::session::StoredDecision;
-use super::{Decision, DecisionSource, RequestCtx, RouteError, resolve};
+use super::signals::ToolSignals;
+use super::{Decision, DecisionSource, RequestCtx, RouteError, resolve, scorer, signals};
 use crate::backend::BackendError;
-use crate::config::Router;
+use crate::config::{Config, Router};
 use crate::exec::chain::{ActiveSlot, outcome_for};
 use crate::http::State;
 use crate::log;
@@ -65,6 +66,11 @@ impl Policy for StaticPolicy {
             source,
             rationale,
             label: None,
+            chain: ctx
+                .cfg
+                .chains
+                .contains_key(ctx.model)
+                .then(|| ctx.model.to_string()),
         })
     }
 }
@@ -108,6 +114,7 @@ impl Policy for ClassifierPolicy {
                     prev.source.as_str()
                 ),
                 label: prev.label,
+                chain: prev.chain,
             });
         }
         let (class, source, classifier_ms) = classify_task(state, router_cfg, ctx.messages);
@@ -141,6 +148,7 @@ impl Policy for ClassifierPolicy {
                 legs: legs.clone(),
                 source,
                 label: label.clone(),
+                chain: ctx.cfg.chains.contains_key(&target).then(|| target.clone()),
             };
             state
                 .sessions
@@ -151,8 +159,238 @@ impl Policy for ClassifierPolicy {
             source,
             rationale,
             label,
+            chain: ctx.cfg.chains.contains_key(&target).then_some(target),
         })
     }
+}
+
+/// §7 — the signal router.
+///
+/// The scorer's role here is **ranker, not decider**. Quota pressure sets *how
+/// many* turns get the flat-rate backend; the score only chooses *which* ones,
+/// and only once headroom is actually scarce. With pressure below
+/// `reserve_threshold` the whole cascade is one comparison and a return (rung 4),
+/// which is the property that makes this safe to enable by default.
+pub struct SignalPolicy {
+    pub router: String,
+}
+
+impl Policy for SignalPolicy {
+    fn decide(&self, ctx: &RequestCtx, state: &State) -> Result<Decision, RouteError> {
+        let Some(r) = ctx.cfg.routers.get(&self.router) else {
+            return Err(router_error(format!("router '{}' is gone", self.router)));
+        };
+        // Rung 1: session affinity.
+        if r.session_affinity
+            && let Some(key) = ctx.session
+            && let Some(prev) = state.sessions.get(key).and_then(|st| st.decision)
+        {
+            return Ok(Decision {
+                legs: prev.legs,
+                source: DecisionSource::Affinity,
+                rationale: format!(
+                    "session affinity: reusing this conversation's {} decision",
+                    prev.source.as_str()
+                ),
+                label: prev.label,
+                chain: prev.chain,
+            });
+        }
+
+        let chain_name = r.chain.as_deref().unwrap_or(&ctx.cfg.server.default_chain);
+        let legs: Vec<String> = resolve::resolve(chain_name, ctx.cfg)
+            .map_err(router_error)?
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let label = Some(format!("signals/{chain_name}"));
+        let leg0 = legs.first().cloned().unwrap_or_default();
+
+        // §7.5: an unknown limit yields no pressure, so an unconfigured server
+        // behaves exactly as it does today until it hits a 429.
+        let pressure = state.stats.pressure(&leg0).unwrap_or(0.0);
+        let sig = signals::extract(
+            ctx.raw.get("messages").unwrap_or(&serde_json::Value::Null),
+            r.recent_turn_window,
+        );
+
+        let gate_chain = ctx
+            .cfg
+            .chains
+            .contains_key(chain_name)
+            .then(|| chain_name.to_string());
+        let finish = |legs: Vec<String>, source, rationale: String| {
+            let d = Decision {
+                legs,
+                source,
+                rationale,
+                label: label.clone(),
+                chain: gate_chain.clone(),
+            };
+            store_affinity(state, ctx, r, &d);
+            Ok(d)
+        };
+
+        // Rung 2: leg 0 is past the wall. Skipped, not cooled — the backend is
+        // healthy, it is just out of quota until the window resets.
+        if pressure >= 1.0 {
+            if let Some(rest) = shed(&legs, &sig, ctx.cfg) {
+                return finish(
+                    rest,
+                    DecisionSource::Quota,
+                    format!("{leg0} is quota-exhausted; starting one leg deeper"),
+                );
+            }
+            // Nothing agentic-safe deeper: better to try the exhausted leg and
+            // get a real 429 than to hand a tool-running turn to a prose model.
+            return finish(
+                legs,
+                DecisionSource::Quota,
+                format!("{leg0} is quota-exhausted but no agentic-safe leg is deeper"),
+            );
+        }
+
+        // Rung 3: a critical error or a compacted context. Unconditional.
+        if scorer::should_escalate(&sig) {
+            let why = if sig.compacted {
+                "context was compacted"
+            } else {
+                "critical tool error"
+            };
+            return finish(
+                legs,
+                DecisionSource::Override,
+                format!("{why}; forcing the flat-rate leg"),
+            );
+        }
+
+        // Rung 4: headroom. The common path, and deliberately the cheapest one —
+        // no shedding, no classifier, one comparison and a return.
+        if pressure < r.reserve_threshold {
+            return finish(
+                legs,
+                DecisionSource::Static,
+                format!(
+                    "quota pressure {pressure:.2} < reserve {:.2}; leg 0",
+                    r.reserve_threshold
+                ),
+            );
+        }
+
+        // --- Rationing from here down. ---
+        let sc = scorer::score(&sig);
+
+        // Rung 5: a settled run — tests passed, work was produced, nothing broke.
+        if scorer::should_deescalate(&sig)
+            && let Some(rest) = shed(&legs, &sig, ctx.cfg)
+        {
+            return finish(
+                rest,
+                DecisionSource::Settled,
+                format!("tests passed and no errors under pressure {pressure:.2}; shedding a leg"),
+            );
+        }
+
+        // Rung 6: the scorer is decisive.
+        if sc.confidence >= r.confidence_threshold {
+            if sc.score > 0.0 {
+                return finish(
+                    legs,
+                    DecisionSource::Dimensions,
+                    format!(
+                        "score {:+.2} (confidence {:.2}) says this turn is worth the quota",
+                        sc.score, sc.confidence
+                    ),
+                );
+            }
+            if let Some(rest) = shed(&legs, &sig, ctx.cfg) {
+                return finish(
+                    rest,
+                    DecisionSource::Dimensions,
+                    format!(
+                        "score {:+.2} (confidence {:.2}) under pressure {pressure:.2}; shedding a leg",
+                        sc.score, sc.confidence
+                    ),
+                );
+            }
+        }
+
+        // Rung 7: sub-threshold, so ask the classifier if one is configured.
+        if r.classifier.is_some() {
+            let (class, source, ms) = classify_task(state, r, ctx.messages);
+            if source == DecisionSource::Classifier
+                && let Some(target) = r.routes.get(&class).cloned()
+                && let Ok(names) = resolve::resolve(&target, ctx.cfg)
+            {
+                return finish(
+                    names.iter().map(|s| s.to_string()).collect(),
+                    DecisionSource::Classifier,
+                    format!("score was indecisive; classifier chose '{class}' in {ms}ms"),
+                );
+            }
+        }
+
+        // Rung 8: nothing was decisive, and we are rationing — shed. §7.6: "a turn
+        // whose score does not clear confidence_threshold on the capable side
+        // starts one leg deeper, preserving the flat-rate leg."
+        match shed(&legs, &sig, ctx.cfg) {
+            Some(rest) => finish(
+                rest,
+                DecisionSource::FallOpen,
+                format!("no decisive signal under pressure {pressure:.2}; shedding a leg"),
+            ),
+            None => finish(
+                legs,
+                DecisionSource::FallOpen,
+                "no decisive signal and no agentic-safe leg deeper; staying at leg 0".to_string(),
+            ),
+        }
+    }
+}
+
+/// §7.6's agentic constraint: start one leg deeper, but **never** shed a
+/// tool-running turn to a text-only backend.
+///
+/// `codex` writing files is not substitutable by `or-sonnet` returning prose
+/// *about* writing files — the request would "succeed" and return the wrong kind
+/// of artifact entirely. Spending quota you meant to save is recoverable next
+/// window; silently returning prose where the caller expected an edit is not.
+/// Returns `None` when there is nothing safe to shed to, and the caller keeps
+/// leg 0 regardless of pressure.
+fn shed(legs: &[String], sig: &ToolSignals, cfg: &Config) -> Option<Vec<String>> {
+    if legs.len() < 2 {
+        return None;
+    }
+    if sig.recent_ops() == 0 {
+        // No tool history: any deeper leg will do.
+        return Some(legs[1..].to_vec());
+    }
+    let start = legs
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, n)| cfg.backends.get(*n).is_some_and(|b| b.is_agentic()))
+        .map(|(i, _)| i)?;
+    Some(legs[start..].to_vec())
+}
+
+/// §6.3: a signals decision is stored for affinity on the same terms a
+/// classifier one is — including a fall-open, so a noisy turn is not re-scored
+/// (and possibly re-classified) every turn of the conversation.
+fn store_affinity(state: &State, ctx: &RequestCtx, r: &Router, d: &Decision) {
+    if !r.session_affinity {
+        return;
+    }
+    let Some(key) = ctx.session else { return };
+    let stored = StoredDecision {
+        legs: d.legs.clone(),
+        source: d.source,
+        label: d.label.clone(),
+        chain: d.chain.clone(),
+    };
+    state
+        .sessions
+        .update(key, |st| st.decision = Some(stored.clone()));
 }
 
 fn router_error(message: String) -> RouteError {
@@ -192,14 +430,17 @@ pub fn classify_task(
             truncated
         ),
     };
-    let Some(classifier) = state.backends.get(&router_cfg.classifier) else {
+    let Some(classifier_name) = router_cfg.classifier.as_deref() else {
+        return fall_open(router_cfg);
+    };
+    let Some(classifier) = state.backends.get(classifier_name) else {
         return fall_open(router_cfg);
     };
     // U-20: honor the classifier backend's concurrency cap. At capacity, degrade
     // to the fallback class rather than spawning an uncounted session (the same
     // cap run_chain enforces on chain legs). Routing never fails the request.
     let _slot = match classifier.max_concurrent() {
-        Some(max) => match ActiveSlot::try_acquire(&state.active, &router_cfg.classifier, max) {
+        Some(max) => match ActiveSlot::try_acquire(&state.active, classifier_name, max) {
             Some(slot) => Some(slot),
             None => return fall_open(router_cfg),
         },
@@ -216,26 +457,24 @@ pub fn classify_task(
     // classifier is a routing behavior change, not observation, and routing
     // already degrades to the fallback class on its own.
     match &result {
-        Ok(_) => {
-            state
-                .stats
-                .record_backend(&router_cfg.classifier, crate::stats::Outcome::Success, ms)
-        }
+        Ok(_) => state
+            .stats
+            .record_backend(classifier_name, crate::stats::Outcome::Success, ms),
         Err(e) => {
             state
                 .stats
-                .record_backend(&router_cfg.classifier, outcome_for(e), ms);
-            if let BackendError::Http(_, 429, _) = e {
+                .record_backend(classifier_name, outcome_for(e), ms);
+            if let BackendError::RateLimited(_, after, _) = e {
                 state.stats.record_rate_limited(
-                    &router_cfg.classifier,
-                    Some(Duration::from_secs(state.cfg.server.cooldown_secs)),
+                    classifier_name,
+                    Some(after.unwrap_or(Duration::from_secs(state.cfg.server.cooldown_secs))),
                 );
             }
         }
     }
     let (class, source) = match result {
-        Ok(r) => parse_class(&r.content, &router_cfg.routes, &router_cfg.fallback_class),
-        Err(_) => (router_cfg.fallback_class.clone(), DecisionSource::FallOpen),
+        Ok(r) => parse_class(&r.content, &router_cfg.routes, &fallback_class(router_cfg)),
+        Err(_) => (fallback_class(router_cfg), DecisionSource::FallOpen),
     };
     state
         .stats
@@ -246,11 +485,15 @@ pub fn classify_task(
 /// A fall-open that never reached the classifier: no call, so no latency and
 /// nothing for `/v1/stats` to average.
 fn fall_open(router_cfg: &Router) -> (String, DecisionSource, u64) {
-    (
-        router_cfg.fallback_class.clone(),
-        DecisionSource::FallOpen,
-        0,
-    )
+    (fallback_class(router_cfg), DecisionSource::FallOpen, 0)
+}
+
+/// `fallback_class` is optional in the struct because a `signals` router without
+/// a classifier has no classes at all. `validate()` requires it wherever it is
+/// actually consulted, so an empty string here is unreachable in a valid config
+/// and would fall through to the "no route for class" error rather than panic.
+fn fallback_class(router_cfg: &Router) -> String {
+    router_cfg.fallback_class.clone().unwrap_or_default()
 }
 
 /// §4.1: map a classifier reply onto one of the router's classes.

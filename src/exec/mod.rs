@@ -5,3 +5,4 @@
 //! they run. That boundary is the point of the split.
 
 pub mod chain;
+pub mod gate;
