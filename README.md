@@ -48,6 +48,7 @@ For step-by-step install + service setup + verification, see
 | `POST` | `/v1/stats/reset` | zero the counters (for benchmarking runs) |
 | `GET` | `/metrics` | Prometheus text format 0.0.4 — **off by default**, enable with `[server] metrics = true` |
 | `POST` | `/v1/chat/completions` | OpenAI chat completions (JSON or SSE) |
+| `POST` | `/v1/messages` | Anthropic Messages, **text-only** — see the ceiling below |
 
 Reserved namespaces (`/`, `/ui/*`, `/api/*`) return `501` for a future web UI. A
 known path reached with the wrong method returns `405` with an `Allow` header
@@ -148,14 +149,40 @@ without sending a request. `--replay` runs captured conversations through the
 scorer with no model calls and no server, which is what makes the routing
 thresholds measurable rather than guessed — see [`docs/replay.md`](./docs/replay.md).
 
-## Streaming limitation
+## Streaming
 
-V1 backends are blocking: `cli`/`tmuxlet` emit output only after the child
-exits, and `api` is a single non-streamed call. So with `stream: true` the
-server sends the `200` status and SSE headers immediately, then emits
-`: keepalive` comment frames every 15s while the backend runs; once the response
-is ready the real frames (role-prime → content → final → `[DONE]`) are emitted
-all at once. True incremental token streaming is V2.
+**`api` backends stream for real.** With `stream: true` the upstream is called
+with `stream: true` too and tokens are relayed as they arrive.
+
+The design constraint that governs this: *streaming and chain fallback are
+mutually exclusive after the first byte.* Once a `data:` frame has gone out
+there is no un-sending it. So the commit point is **first-token success** —
+connect failures, a non-2xx, an unparseable first frame all happen before
+anything is written and still fall through the chain normally. A leg that fails
+*after* relaying a token ends the response rather than splicing a second
+backend's answer onto the first.
+
+**`tmuxlet` and `cli` backends do not stream, permanently.** They are
+structurally blocking: the child emits at exit, and a PTY's intermediate output
+is TUI redraw, not tokens. For those the server sends the `200` and SSE headers
+immediately, emits `: keepalive` comment frames every 15s while the backend
+runs, then the real frames all at once. That is not a gap to be closed.
+
+`/v1/messages` always buffers: Anthropic's event sequence cannot be re-shaped
+from a relayed OpenAI chunk after the fact.
+
+## The `/v1/messages` ceiling
+
+Because our backends are text-in/text-out, the Anthropic surface is a shallow
+translation — the request is normalized to the OpenAI shape at the door, so
+routing, the classifier, signal extraction and prompt shaping all work
+unchanged, and only the response envelope differs.
+
+**A client that sends `tools` and expects `tool_use` blocks back will not
+work.** That is most of Claude Code's real usage. The endpoint refuses such a
+request with a `400` naming the limitation rather than returning prose where the
+caller expected a tool call. It serves text-shaped Anthropic clients; it does
+not make tmuxlet-server a drop-in Anthropic provider.
 
 ## Dependency budget
 

@@ -560,3 +560,78 @@ fn an_excluded_leg_reports_why_when_every_leg_is_excluded() {
         "conv-2 inherited conv-1's exclusions: {b3}"
     );
 }
+
+/// §6.3, the case the spec does not spell out: a session id belongs to the
+/// **client**, not to a route.
+///
+/// Nothing stops one conversation from addressing two routers with the same id,
+/// and `SessionState.decision` is a single slot. Without the router recorded on
+/// the stored decision, the second router replays the first's — silently sending
+/// the turn to a chain the operator never routed it to, with a
+/// `x-tmuxlet-decision: affinity` header that looks entirely healthy.
+#[test]
+fn two_routers_sharing_a_session_id_do_not_inherit_each_others_decisions() {
+    let port = common::free_port();
+    let cfg = format!(
+        r#"
+[server]
+listen = "127.0.0.1:{port}"
+default_chain = "a"
+env_source = "process"
+
+[backends.ea]
+type = "cli"
+bin = "/bin/echo"
+args = ["FROM-A"]
+stdin_prompt = true
+
+[backends.eb]
+type = "cli"
+bin = "/bin/echo"
+args = ["FROM-B"]
+stdin_prompt = true
+
+[chains.a]
+order = ["ea"]
+
+[chains.b]
+order = ["eb"]
+
+[routers.ra]
+classifier = "ea"
+fallback_class = "only"
+routes = {{ only = "a" }}
+
+[routers.rb]
+classifier = "eb"
+fallback_class = "only"
+routes = {{ only = "b" }}
+"#
+    );
+    let server = common::start(&cfg);
+    let hdr = [("x-tmuxlet-session-id", "shared-across-routers")];
+
+    // Interleaved, so the second round is served from affinity for both.
+    for round in 0..2 {
+        let (sa, ha, ba) = chat(&server, "ra", &hdr);
+        assert_eq!(sa, 200, "{ba}");
+        assert!(ba.contains("FROM-A"), "round {round}, router ra: {ba}");
+        assert_eq!(
+            ha.get("x-tmuxlet-route").map(String::as_str),
+            Some("ra/only/a/ea"),
+            "round {round}: ra must keep its own route"
+        );
+
+        let (sb, hb, bb) = chat(&server, "rb", &hdr);
+        assert_eq!(sb, 200, "{bb}");
+        assert!(
+            bb.contains("FROM-B"),
+            "round {round}, router rb inherited ra's decision: {bb}"
+        );
+        assert_eq!(
+            hb.get("x-tmuxlet-route").map(String::as_str),
+            Some("rb/only/b/eb"),
+            "round {round}: rb must keep its own route"
+        );
+    }
+}

@@ -619,7 +619,9 @@ fn run_explain(config_path: &str, model: &str) -> ExitCode {
             println!("  chain: {chain}");
             print_legs(&cfg, chain, "    ");
             println!("cascade (§7.7), first match wins:");
-            println!("  1 affinity   session hit reuses the earlier decision");
+            println!("  1 affinity   (not used by a signals router: rungs 2-6 depend on live");
+            println!("               quota pressure, so replaying them would be wrong. Affinity");
+            println!("               applies to the classifier at rung 7.)");
             println!("  2 quota      leg 0 pressure == 1.0 -> start one leg deeper");
             println!("  3 override   compacted context or a critical tool error -> leg 0");
             println!(

@@ -79,6 +79,11 @@ pub fn key_from_messages(messages: &[ChatMessage]) -> Option<SessionKey> {
 /// A decision worth replaying on the next turn of the same conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredDecision {
+    /// Which router stored this. A session id belongs to the *client*, not to a
+    /// route, and nothing stops one conversation from addressing two routers —
+    /// replaying `do`'s decision for a request to `review` would silently send
+    /// the turn to the wrong chain. Checked on read.
+    pub router: String,
     pub legs: Vec<String>,
     /// What produced it originally. Kept so an affinity hit can say *what* it is
     /// reusing, which is the difference between a useful rationale and "cached".
@@ -274,6 +279,7 @@ mod tests {
         assert!(s.get(&k).is_none());
         s.update(&k, |st| {
             st.decision = Some(StoredDecision {
+                router: "r".into(),
                 legs: vec!["a".into(), "b".into()],
                 source: DecisionSource::Classifier,
                 label: Some("code/do-code".into()),
@@ -283,6 +289,26 @@ mod tests {
         let got = s.get(&k).unwrap().decision.unwrap();
         assert_eq!(got.legs, vec!["a", "b"]);
         assert_eq!(got.source, DecisionSource::Classifier);
+    }
+
+    #[test]
+    fn a_stored_decision_names_the_router_that_stored_it() {
+        // One conversation can address two routers with the same session id.
+        // Without the router on the record there is no way to tell whose decision
+        // is in the slot, and the second router silently inherits the first's.
+        let s = SessionStore::new(16, 7200);
+        let k = SessionKey::Header("shared".into());
+        s.update(&k, |st| {
+            st.decision = Some(StoredDecision {
+                router: "do".into(),
+                legs: vec!["do-leg".into()],
+                source: DecisionSource::Classifier,
+                label: None,
+                chain: None,
+            });
+        });
+        let got = s.get(&k).unwrap().decision.unwrap();
+        assert_eq!(got.router, "do");
     }
 
     #[test]
@@ -326,6 +352,7 @@ mod tests {
         let k = SessionKey::Header("k".into());
         s.update(&k, |st| {
             st.decision = Some(StoredDecision {
+                router: "r".into(),
                 legs: vec!["a".into()],
                 source: DecisionSource::Classifier,
                 label: None,

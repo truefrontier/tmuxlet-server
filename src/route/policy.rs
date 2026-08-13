@@ -97,7 +97,11 @@ impl Policy for ClassifierPolicy {
         // run we would otherwise pay a round-trip to classify "yes, continue".
         if router_cfg.session_affinity
             && let Some(key) = ctx.session
-            && let Some(prev) = state.sessions.get(key).and_then(|st| st.decision)
+            && let Some(prev) = state
+                .sessions
+                .get(key)
+                .and_then(|st| st.decision)
+                .filter(|d| d.router == self.router)
         {
             log::debug(&format!(
                 "{} route {} affinity session={} legs={}",
@@ -145,6 +149,7 @@ impl Policy for ClassifierPolicy {
             && let Some(key) = ctx.session
         {
             let stored = StoredDecision {
+                router: self.router.clone(),
                 legs: legs.clone(),
                 source,
                 label: label.clone(),
@@ -322,7 +327,7 @@ impl Policy for SignalPolicy {
                     .sessions
                     .get(key)
                     .and_then(|st| st.decision)
-                    .filter(|d| d.source == DecisionSource::Classifier)
+                    .filter(|d| d.router == self.router && d.source == DecisionSource::Classifier)
             {
                 return Ok(Decision {
                     legs: prev.legs,
@@ -346,7 +351,7 @@ impl Policy for SignalPolicy {
                     label: Some(format!("{class}/{target}")),
                     chain: ctx.cfg.chains.contains_key(&target).then_some(target),
                 };
-                store_affinity(state, ctx, r, &d);
+                store_affinity(state, ctx, &self.router, r, &d);
                 return Ok(d);
             }
         }
@@ -398,12 +403,13 @@ fn shed(legs: &[String], sig: &ToolSignals, cfg: &Config) -> Option<Vec<String>>
 /// §6.3: a signals decision is stored for affinity on the same terms a
 /// classifier one is — including a fall-open, so a noisy turn is not re-scored
 /// (and possibly re-classified) every turn of the conversation.
-fn store_affinity(state: &State, ctx: &RequestCtx, r: &Router, d: &Decision) {
+fn store_affinity(state: &State, ctx: &RequestCtx, router: &str, r: &Router, d: &Decision) {
     if !r.session_affinity {
         return;
     }
     let Some(key) = ctx.session else { return };
     let stored = StoredDecision {
+        router: router.to_string(),
         legs: d.legs.clone(),
         source: d.source,
         label: d.label.clone(),

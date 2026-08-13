@@ -58,6 +58,13 @@ order = ["claude-thinking", "agy"]
 # OUT: the happy path above stays minimal (UX invariant 4). Uncomment and adjust.
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── Top-level ───────────────────────────────────────────────────────────────
+# schema_version = 1                # §10: the config format version. Absent means
+#                                   #   1 forever, so a config written before this
+#                                   #   key existed keeps working; a number this
+#                                   #   binary does not speak is a clear error
+#                                   #   rather than a confusing parse failure.
+
 # ── [server] optional keys ──────────────────────────────────────────────────
 # request_timeout_secs = 1800       # per-leg dispatch timeout (tmuxlet/cli run minutes)
 # env_source = "shell"              # "shell" (run $SHELL -ilc env) | "process"
@@ -203,5 +210,8 @@ order = ["claude-thinking", "agy"]
 # A signals router needs real tool traffic. A plain chat client (curl, a bare
 # completion) has no tool history, scores 0.0, and lands on leg 0 every time.
 #
-# Observability: the response carries `x-tmuxlet-route: class/chain/backend`, and
+# Observability: every response carries `x-tmuxlet-route: model/class/target/backend`
+# (`model/backend` for a direct chain), plus `x-tmuxlet-backend`,
+# `x-tmuxlet-decision` and `x-tmuxlet-rationale`; `GET /v1/stats` reports traffic
+# and quota, and
 # GET /v1/backends shows per-backend health (state ok|cooling|busy|unknown).

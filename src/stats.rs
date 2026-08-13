@@ -404,33 +404,37 @@ impl Stats {
         inner.backend(name, now).limit_hint = limit;
     }
 
-    /// §7.5: override the per-backend quota window. Called once at startup from
-    /// `quota_window_secs`; a zero or absent value keeps the default.
-    pub fn set_quota_window(&self, name: &str, secs: u64) {
-        if secs == 0 {
-            return;
-        }
+    /// §7.5: the per-backend quota window. `None` (or zero, which would mean "roll
+    /// on every read") restores the default — this is called on every config load
+    /// including a SIGHUP reload, so it has to be able to *clear* a setting the
+    /// operator removed, not only apply one they added.
+    pub fn set_quota_window(&self, name: &str, secs: Option<u64>) {
         let now = Instant::now();
         let mut inner = self.inner();
-        inner.backend(name, now).window = Duration::from_secs(secs);
+        inner.backend(name, now).window = match secs {
+            Some(s) if s > 0 => Duration::from_secs(s),
+            _ => QUOTA_WINDOW,
+        };
     }
 
     /// §7.5 tier 3: learn the limit from where a 429 landed.
     ///
     /// Costs one failed leg per window to discover, and is the only option that
-    /// works when the provider's limit is opaque or varies with load. Records the
-    /// **current** `calls_in_window` — the count that just proved to be too many —
-    /// and only ever lowers an existing hint, so one anomalously high window
-    /// cannot inflate the estimate permanently.
+    /// works when the provider's limit is opaque or varies with load.
+    ///
+    /// Records the **latest** observation, replacing any previous one. An earlier
+    /// design took the running minimum, which sounds conservative and is not: one
+    /// early 429 — a transient upstream blip, a limit shared with another client,
+    /// a window this process joined halfway through — would pin the estimate at
+    /// that call count *forever*, and every later window would ration against a
+    /// number the provider never enforced. §7.5 says "record `calls_in_window` at
+    /// the first 429 and carry it as next window's limit_hint"; carrying the most
+    /// recent observation is what lets a bad one age out.
     pub fn learn_limit(&self, name: &str) {
         let now = Instant::now();
         let mut inner = self.inner();
         let stat = inner.backend(name, now);
-        let observed = stat.calls_in_window.max(1);
-        stat.limit_hint = Some(match stat.limit_hint {
-            Some(prev) => prev.min(observed),
-            None => observed,
-        });
+        stat.limit_hint = Some(stat.calls_in_window.max(1));
     }
 
     /// `POST /v1/stats/reset` — for benchmarking runs (§5.2).
@@ -451,9 +455,12 @@ impl Stats {
         inner.classifier_fail_open = 0;
         inner.classifier_total_ms = 0;
         for stat in inner.backends.values_mut() {
-            let carried = (stat.limit_hint, stat.exhausted_until);
+            let carried = (stat.limit_hint, stat.exhausted_until, stat.window);
             let mut fresh = BackendStat::new(now);
             fresh.limit_hint = carried.0;
+            // The window is configuration, not a counter — resetting the stats
+            // must not quietly revert a backend to the default hour.
+            fresh.window = carried.2;
             fresh.exhausted_until = carried.1.filter(|t| *t > now);
             // The open window's banked seconds are gone with the counter, so it
             // restarts here rather than back-dating into the reset run.
@@ -924,7 +931,7 @@ mod tests {
         // catch it, since it rewinds by exactly QUOTA_WINDOW and passes either
         // way.
         let s = Stats::new();
-        s.set_quota_window("a", 60);
+        s.set_quota_window("a", Some(60));
         s.set_limit_hint("a", Some(10));
         for _ in 0..5 {
             s.record_backend("a", Outcome::Success, 1);

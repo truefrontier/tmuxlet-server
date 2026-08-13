@@ -151,14 +151,15 @@ impl State {
                 (name.clone(), p)
             })
             .collect();
-        // §7.5 tiers 2 and 3 are startup facts, so seed them before serving.
+        // §7.5 tiers 2 and 3 are config facts, applied unconditionally rather
+        // than only when present. U-22 reuses the same Stats across a SIGHUP
+        // reload, so an `if let Some(..)` here would leave a limit standing after
+        // the operator deleted the key — the server would keep rationing against
+        // a number no longer in the config, which is exactly the kind of thing
+        // nobody thinks to check.
         for (name, b) in &cfg.backends {
-            if let Some(n) = b.quota_calls() {
-                stats.set_limit_hint(name, Some(n));
-            }
-            if let Some(w) = b.quota_window_secs() {
-                stats.set_quota_window(name, w);
-            }
+            stats.set_limit_hint(name, b.quota_calls());
+            stats.set_quota_window(name, b.quota_window_secs());
         }
         State {
             cfg,
