@@ -177,7 +177,12 @@ impl BackendStat {
     /// every read and write path, which is what makes both lazy: no timer thread,
     /// and a backend nobody touches costs nothing.
     fn touch(&mut self, now: Instant) {
-        if now.saturating_duration_since(self.window_start) >= QUOTA_WINDOW {
+        // `self.window`, NOT the module const: a backend configured
+        // `quota_window_secs = 60` must roll every minute. Reading the const here
+        // made the per-backend setting a silent no-op, leaving pressure inflated
+        // for the rest of the hour after the provider's real window had reset —
+        // so rungs 2 and 4 both misfired for anyone whose window is not 60 min.
+        if now.saturating_duration_since(self.window_start) >= self.window {
             self.window_start = now;
             self.calls_in_window = 0;
         }
@@ -908,6 +913,42 @@ mod tests {
         assert_eq!(s.pressure("b"), Some(1.0));
         s.rewind(Duration::from_secs(2));
         assert_eq!(s.pressure("b"), None);
+    }
+
+    #[test]
+    fn a_configured_quota_window_actually_governs_the_rollover() {
+        // §7.5: `quota_window_secs` is per-backend because a subscription's window
+        // and an API key's are not the same length. This test exists because
+        // `touch()` read the module const instead of the configured value, which
+        // made the setting a silent no-op — and the sibling test below could not
+        // catch it, since it rewinds by exactly QUOTA_WINDOW and passes either
+        // way.
+        let s = Stats::new();
+        s.set_quota_window("a", 60);
+        s.set_limit_hint("a", Some(10));
+        for _ in 0..5 {
+            s.record_backend("a", Outcome::Success, 1);
+        }
+        assert_eq!(s.pressure("a"), Some(0.5));
+        // Past the CONFIGURED minute, nowhere near the default hour.
+        s.rewind(Duration::from_secs(61));
+        assert_eq!(
+            s.pressure("a"),
+            Some(0.0),
+            "a 60s window must roll at 61s, not at 3601s"
+        );
+        // A backend with no configured window still uses the default.
+        let d = Stats::new();
+        d.set_limit_hint("b", Some(10));
+        for _ in 0..5 {
+            d.record_backend("b", Outcome::Success, 1);
+        }
+        d.rewind(Duration::from_secs(61));
+        assert_eq!(
+            d.pressure("b"),
+            Some(0.5),
+            "an unconfigured backend keeps the default hour"
+        );
     }
 
     #[test]
