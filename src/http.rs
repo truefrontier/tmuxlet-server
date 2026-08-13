@@ -281,6 +281,30 @@ fn respond_err(req: Request, status: u16, msg: &str, etype: &str, code: Option<&
     );
 }
 
+/// §9.1: the same error in whichever envelope the caller's endpoint speaks.
+///
+/// An OpenAI-shaped body coming back from `/v1/messages` is a contract break: an
+/// Anthropic client parses `{"type":"error","error":{...}}` and will not find
+/// anything where we put it.
+fn respond_err_shaped(
+    req: Request,
+    anthropic_shape: bool,
+    status: u16,
+    msg: &str,
+    etype: &str,
+    code: Option<&str>,
+) {
+    if anthropic_shape {
+        respond_json(
+            req,
+            status,
+            anthropic::error_envelope(etype, msg).to_string(),
+        );
+    } else {
+        respond_err(req, status, msg, etype, code);
+    }
+}
+
 fn respond_head(req: Request) {
     // U-17: HEAD mirrors GET headers with an empty body.
     let resp =
@@ -644,8 +668,9 @@ fn handle_chat(
     let raw_value: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(e) => {
-            return respond_err(
+            return respond_err_shaped(
                 req,
+                anthropic_shape,
                 400,
                 &format!("parse error: {e}"),
                 "invalid_request_error",
@@ -656,8 +681,9 @@ fn handle_chat(
     let parsed: openai::ChatRequest = match openai::ChatRequest::deserialize(&raw_value) {
         Ok(p) => p,
         Err(e) => {
-            return respond_err(
+            return respond_err_shaped(
                 req,
+                anthropic_shape,
                 400,
                 &format!("parse error: {e}"),
                 "invalid_request_error",
@@ -666,8 +692,9 @@ fn handle_chat(
         }
     };
     if parsed.messages.is_empty() {
-        return respond_err(
+        return respond_err_shaped(
             req,
+            anthropic_shape,
             400,
             "messages must not be empty",
             "invalid_request_error",
@@ -702,7 +729,14 @@ fn handle_chat(
             // No Decision exists here — routing itself failed — so there is no
             // provenance to report beyond the error envelope's own code.
             state.stats.record_request(false);
-            return respond_err(req, e.status, &e.message, e.etype, Some(e.code));
+            return respond_err_shaped(
+                req,
+                anthropic_shape,
+                e.status,
+                &e.message,
+                e.etype,
+                Some(e.code),
+            );
         }
     };
     if decision.source == DecisionSource::Default {
@@ -800,6 +834,11 @@ fn handle_chat(
                 first,
             );
             let (status, body) = chain_error_response(&errors, state.redact_errors);
+            let body = if anthropic_shape {
+                anthropic::error_envelope("api_error", &chain_error_message(&errors)).to_string()
+            } else {
+                body
+            };
             respond_json_with(
                 req,
                 status,
@@ -900,13 +939,29 @@ fn stream_with_keepalive(
     // they arrive. `first` flips on the first token — the commit point — and the
     // role-priming frame goes out with it so the client sees a well-formed
     // OpenAI stream rather than bare content deltas.
+    // §9.1: an Anthropic request never relays live. Its event sequence differs
+    // from OpenAI's and cannot be re-shaped from a relayed chunk after the fact,
+    // so the whole reply is buffered and emitted as Anthropic events at the end.
+    // Without this a client got OpenAI `chat.completion.chunk` frames live and
+    // *then* the Anthropic events — two protocols in one stream.
+    let relay_live = !anthropic_shape;
     let tx_deltas = tx.clone();
+    // One id and one model for every frame of a relayed stream. The backend's own
+    // model_label is not known until the first token arrives, and switching it
+    // mid-stream would break any client that keys on `id`.
     let stream_id = format!("chatcmpl-{model}");
+    let tail_id = stream_id.clone();
+    let tail_model = model.clone();
     std::thread::spawn(move || {
         let names_ref: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         let mut primed = false;
         let r = dispatch_or_panic_error(&reqid2, || {
             let mut on_delta = |d: &str| {
+                if !relay_live {
+                    // Buffered: dispatch_stream still accumulates the content, so
+                    // the reply is complete — it just is not relayed.
+                    return true;
+                }
                 if !primed {
                     primed = true;
                     if tx_deltas
@@ -1008,8 +1063,9 @@ fn stream_with_keepalive(
                         }
                     }
                 } else if streamed {
-                    // The deltas already went out live; only the tail is left.
-                    for f in openai::stream_tail_frames(&id, &result.model_label) {
+                    // The deltas already went out live; only the tail is left, and
+                    // it must carry the SAME id and model that they did.
+                    for f in openai::stream_tail_frames(&tail_id, &tail_model) {
                         if tx.send(f.into_bytes()).is_err() {
                             return;
                         }
@@ -1039,8 +1095,21 @@ fn stream_with_keepalive(
                 // chain cannot answer 400 here. Take the helper's *body*, which
                 // carries code: "context_length_exceeded", and drop its status.
                 let (_status, body) = chain_error_response(&errors, redact);
-                let _ = tx.send(format!("data: {body}\n\n").into_bytes());
-                let _ = tx.send(b"data: [DONE]\n\n".to_vec());
+                if anthropic_shape {
+                    // Anthropic signals an in-band failure with an `error` event
+                    // and has no `[DONE]` sentinel; emitting OpenAI's would leave
+                    // the client waiting for a stop event that never arrives.
+                    let _ = tx.send(
+                        format!(
+                            "event: error\ndata: {}\n\n",
+                            anthropic::error_envelope("api_error", &chain_error_message(&errors))
+                        )
+                        .into_bytes(),
+                    );
+                } else {
+                    let _ = tx.send(format!("data: {body}\n\n").into_bytes());
+                    let _ = tx.send(b"data: [DONE]\n\n".to_vec());
+                }
             }
         }
     });
@@ -1069,6 +1138,17 @@ fn stream_with_keepalive(
         None,
     );
     let _ = req.respond(apply_cors(resp));
+}
+
+/// U-23's compact summary, on its own so the Anthropic envelope can carry the
+/// same text without inheriting the OpenAI shape around it.
+fn chain_error_message(errors: &[BackendError]) -> String {
+    let summary = errors
+        .iter()
+        .map(|e| format!("{} ({})", e.backend_name(), e.class()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("all backends failed: {summary}")
 }
 
 fn build_503_body(errors: &[BackendError], redact: bool) -> String {

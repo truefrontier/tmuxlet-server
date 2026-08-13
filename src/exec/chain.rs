@@ -80,6 +80,13 @@ pub struct ChainCtx<'a> {
     pub gate: Option<&'a GateCfg>,
 }
 
+/// §9.2: the live delta sink plus the flag recording whether it has ever fired.
+///
+/// They travel together because the commit point is exactly "this sink was
+/// called once", and the chain loop needs to see that to know it can no longer
+/// fall through.
+type DeltaSink<'a> = (&'a mut dyn FnMut(&str) -> bool, &'a mut bool);
+
 /// §9.2: what a streaming chain walk did.
 pub struct StreamOutcome {
     pub result: DispatchResult,
@@ -102,18 +109,12 @@ pub fn run_streaming(
     on_delta: &mut dyn FnMut(&str) -> bool,
 ) -> Result<StreamOutcome, Vec<BackendError>> {
     let mut committed = false;
-    let mut sink = |d: &str| {
-        committed = true;
-        on_delta(d)
-    };
-    match run_inner(state, ctx, Some(&mut sink)) {
-        Ok((result, winner)) => Ok(StreamOutcome {
-            result,
-            winner,
-            streamed: committed,
-        }),
-        Err(e) => Err(e),
-    }
+    let (result, winner) = run_inner(state, ctx, Some((on_delta, &mut committed)))?;
+    Ok(StreamOutcome {
+        result,
+        winner,
+        streamed: committed,
+    })
 }
 
 /// Walk the chain with P-9 cooldown, P-6 budget, and U-20 concurrency. Returns
@@ -125,7 +126,7 @@ pub fn run(state: &State, ctx: &ChainCtx) -> Result<(DispatchResult, String), Ve
 fn run_inner(
     state: &State,
     ctx: &ChainCtx,
-    mut on_delta: Option<&mut dyn FnMut(&str) -> bool>,
+    mut on_delta: Option<DeltaSink>,
 ) -> Result<(DispatchResult, String), Vec<BackendError>> {
     let ChainCtx {
         legs: names,
@@ -255,11 +256,19 @@ fn run_inner(
         // before it can judge, and there is no un-sending a relayed token.
         let can_stream = on_delta.is_some() && backend.supports_streaming() && judge.is_none();
         let result = match (&mut on_delta, can_stream) {
-            (Some(sink), true) => {
-                backend.dispatch_stream(leg_prompt, raw_value, &state.env, timeout, *sink)
+            (Some((sink, committed)), true) => {
+                let mut wrapped = |d: &str| {
+                    // The commit point (§9.2). Recorded HERE rather than in the
+                    // caller's closure so the loop below can see it: once a
+                    // `data:` frame has gone out there is no un-sending it.
+                    **committed = true;
+                    sink(d)
+                };
+                backend.dispatch_stream(leg_prompt, raw_value, &state.env, timeout, &mut wrapped)
             }
             _ => backend.dispatch(leg_prompt, raw_value, &state.env, timeout),
         };
+        let committed = on_delta.as_ref().is_some_and(|(_, c)| **c);
         let elapsed_ms = leg_start.elapsed().as_millis() as u64;
         match result {
             Ok(res) => {
@@ -298,6 +307,18 @@ fn run_inner(
                 return Ok((res, name.to_string()));
             }
             Err(e) => {
+                // §9.2: streaming and chain fallback are mutually exclusive after
+                // the first byte. A leg that failed *after* relaying a token has
+                // already committed the response; advancing would splice a second
+                // backend's answer onto the first one mid-stream.
+                if committed {
+                    log::error(&format!(
+                        "{reqid} backend={name} failed after committing the stream: {e}"
+                    ));
+                    record_failure(state, name, &e, elapsed_ms);
+                    errors.push(e);
+                    return Err(errors);
+                }
                 log::warn(&format!("{reqid} skip backend={name}: {e}"));
                 if let (BackendError::Overflow(..), Some(key)) = (&e, session) {
                     state.sessions.update(key, |st| {
