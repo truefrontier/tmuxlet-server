@@ -156,8 +156,8 @@ fn classifier_at_capacity_degrades_to_the_fallback_class() {
         .get("x-tmuxlet-route")
         .expect("router response must carry x-tmuxlet-route");
     assert!(
-        route.starts_with("quick/"),
-        "B must route via the fallback class: {route}"
+        route.starts_with("smart/quick/"),
+        "B must route via the fallback class (§5.1: model/class/target/backend): {route}"
     );
     assert!(
         elapsed < Duration::from_millis(500),

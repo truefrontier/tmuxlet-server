@@ -8,6 +8,14 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    /// §10: the config format version. **Absent means 1, forever** — every
+    /// `~/.tmuxlet/server.toml` written before this key existed must keep
+    /// working. It is `Option` rather than a defaulted `u32` on purpose:
+    /// validate() has to distinguish "the operator wrote 1" from "the key is not
+    /// there", so a future breaking change can give a real migration error
+    /// instead of guessing.
+    #[serde(default)]
+    pub schema_version: Option<u32>,
     pub server: Server,
     #[serde(default)]
     pub backends: HashMap<String, Backend>,
@@ -75,6 +83,20 @@ pub struct Server {
     /// one follows it. Opt-out, because it changes routing quality.
     #[serde(default = "default_true")]
     pub classifier_include_opening: bool,
+    /// §5.3: expose `/metrics` in Prometheus text format 0.0.4. Off by default —
+    /// it is an operations surface, not part of the OpenAI-compatible contract,
+    /// and it is gated by `auth` like the rest of `/v1/*` when auth is on.
+    #[serde(default)]
+    pub metrics: bool,
+    /// §6.2: hard cap on the session map. **A client-supplied header keying an
+    /// unbounded map is a memory-exhaustion vector**, so this is a cap, not a
+    /// hint: the least-recently-seen entry is evicted at the limit.
+    #[serde(default = "default_session_max")]
+    pub session_max: usize,
+    /// §6.2: how long a session's state survives without a request. Swept
+    /// amortized on insert — no background thread.
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_secs: u64,
 }
 
 fn default_timeout() -> u64 {
@@ -104,6 +126,12 @@ fn default_classifier_timeout() -> u64 {
 fn default_classifier_max_chars() -> usize {
     4000
 }
+fn default_session_max() -> usize {
+    4096
+}
+fn default_session_ttl() -> u64 {
+    7200
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Chain {
@@ -125,6 +153,18 @@ pub struct Router {
     /// class -> chain or backend.
     #[serde(default)]
     pub routes: HashMap<String, String>,
+    /// §6.3: reuse this session's first decision on every later turn, skipping
+    /// the classifier round-trip. On by default: it only engages when the client
+    /// actually sends a session header, and when it does, paying for a fresh
+    /// classification of "yes, continue" is pure waste.
+    #[serde(default = "default_true")]
+    pub session_affinity: bool,
+    /// §6.1: when no session header is present, key the session on a hash of the
+    /// opening user message. **Opt-in**, because the hash collides across
+    /// independent conversations that open with an identical prompt — a real
+    /// hazard for templated agent harnesses.
+    #[serde(default)]
+    pub message_hash_fallback: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +252,23 @@ impl Backend {
             Backend::Cli { .. } => "cli",
         }
     }
+
+    /// §7.3: what a marginal call to this backend actually costs, which is not
+    /// the same question as how capable it is.
+    ///
+    /// `tmuxlet` fronts an interactive subscription: free at the margin until the
+    /// quota window is exhausted, then effectively infinite — a step function, not
+    /// a line. `cli` is local compute, bounded by your hardware. `api` is metered
+    /// dollars. These defaults match how the three types are actually used, so
+    /// most existing configs need no edit; Phase 3 adds a per-backend `cost` key
+    /// that overrides them.
+    pub fn cost_class(&self) -> &'static str {
+        match self {
+            Backend::Tmuxlet { .. } => "subscription",
+            Backend::Api { .. } => "metered",
+            Backend::Cli { .. } => "local",
+        }
+    }
 }
 
 pub fn load(path: &Path) -> Result<(Config, Vec<String>), String> {
@@ -231,7 +288,20 @@ pub fn parse(text: &str) -> Result<Config, String> {
 
 /// Hard errors: conditions under which the server cannot (or must not) serve.
 /// These fail both `--validate` and `serve`.
+/// The only config format this binary understands. §10: bump this and the
+/// `schema_version` check below is what gives an operator a real migration error
+/// instead of a confusing parse failure three keys later.
+pub const SCHEMA_VERSION: u32 = 1;
+
 pub fn validate(cfg: &Config) -> Result<(), String> {
+    if let Some(v) = cfg.schema_version
+        && v != SCHEMA_VERSION
+    {
+        return Err(format!(
+            "schema_version = {v} is not supported by tmuxlet-server {} (which speaks {SCHEMA_VERSION}); upgrade the binary or remove the key",
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
     for (cname, chain) in &cfg.chains {
         if chain.order.is_empty() {
             return Err(format!("chain '{cname}' has an empty order"));
@@ -375,7 +445,7 @@ pub fn lint(cfg: &Config, text: &str) -> Vec<String> {
             _ => None,
         };
         if let Some(m) = pm
-            && crate::openai::PromptMode::parse(m).is_none()
+            && crate::proto::PromptMode::parse(m).is_none()
         {
             out.push(format!(
                 "backends.{bname}.prompt_mode '{m}' is neither 'transcript' nor 'last_user' — using 'transcript'"
@@ -428,7 +498,7 @@ pub fn lint(cfg: &Config, text: &str) -> Vec<String> {
 
 // ---- U-4 unknown-key detection ----
 
-const TOP_KEYS: &[&str] = &["server", "backends", "chains", "routers"];
+const TOP_KEYS: &[&str] = &["schema_version", "server", "backends", "chains", "routers"];
 const SERVER_KEYS: &[&str] = &[
     "listen",
     "default_chain",
@@ -447,6 +517,9 @@ const SERVER_KEYS: &[&str] = &[
     "strict_models",
     "cors_origins",
     "classifier_include_opening",
+    "metrics",
+    "session_max",
+    "session_ttl_secs",
 ];
 const CHAIN_KEYS: &[&str] = &["order"];
 const TMUXLET_KEYS: &[&str] = &[
@@ -490,6 +563,8 @@ const ROUTER_KEYS: &[&str] = &[
     "fallback_class",
     "classifier_prompt",
     "routes",
+    "session_affinity",
+    "message_hash_fallback",
 ];
 
 /// Walk the parsed TOML table one level deep per known section and report keys
@@ -887,6 +962,31 @@ order = ["agy", "ollama-kimi", "claude-thinking"]
                 .any(|x| x.contains("backends.ollama-kimi.prompt_mode")),
             "prompt_mode on an api backend should be an unknown key: {w:?}"
         );
+    }
+
+    #[test]
+    fn schema_version_is_optional_and_rejects_a_future_number() {
+        // §10: absent means 1 forever, so every config written before the key
+        // existed keeps working. A number we do not speak is a real error with a
+        // real instruction, not a parse failure three keys later.
+        let cfg = parse(SAMPLE).unwrap();
+        assert_eq!(cfg.schema_version, None, "absent stays absent");
+        assert!(validate(&cfg).is_ok());
+
+        let pinned = format!("schema_version = 1\n{SAMPLE}");
+        let cfg = parse(&pinned).unwrap();
+        assert_eq!(cfg.schema_version, Some(1));
+        assert!(validate(&cfg).is_ok());
+        assert!(
+            lint(&cfg, &pinned).is_empty(),
+            "schema_version must be a known top-level key: {:?}",
+            lint(&cfg, &pinned)
+        );
+
+        let future = format!("schema_version = 99\n{SAMPLE}");
+        let cfg = parse(&future).unwrap();
+        let err = validate(&cfg).expect_err("an unknown schema must be refused");
+        assert!(err.contains("schema_version = 99"), "{err}");
     }
 
     #[test]

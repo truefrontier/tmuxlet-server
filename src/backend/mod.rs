@@ -134,7 +134,7 @@ pub struct TmuxletBackend {
     /// U-20: max simultaneous dispatches (None = unlimited).
     pub max_concurrent: Option<usize>,
     /// U-14: prompt shaping mode.
-    pub prompt_mode: crate::openai::PromptMode,
+    pub prompt_mode: crate::proto::PromptMode,
 }
 
 pub struct ApiBackend {
@@ -169,7 +169,7 @@ pub struct CliBackend {
     /// U-20: max simultaneous dispatches (None = unlimited).
     pub max_concurrent: Option<usize>,
     /// U-14: prompt shaping mode.
-    pub prompt_mode: crate::openai::PromptMode,
+    pub prompt_mode: crate::proto::PromptMode,
 }
 
 pub enum Backend {
@@ -270,7 +270,7 @@ impl Backend {
                 max_concurrent: *max_concurrent,
                 prompt_mode: prompt_mode
                     .as_deref()
-                    .and_then(crate::openai::PromptMode::parse)
+                    .and_then(crate::proto::PromptMode::parse)
                     .unwrap_or_default(),
             }),
             config::Backend::Api {
@@ -322,7 +322,7 @@ impl Backend {
                 max_concurrent: *max_concurrent,
                 prompt_mode: prompt_mode
                     .as_deref()
-                    .and_then(crate::openai::PromptMode::parse)
+                    .and_then(crate::proto::PromptMode::parse)
                     .unwrap_or_default(),
             }),
         }
@@ -366,11 +366,11 @@ impl Backend {
     }
 
     /// U-14: prompt shaping mode (api backends pass raw JSON, so Transcript).
-    pub fn prompt_mode(&self) -> crate::openai::PromptMode {
+    pub fn prompt_mode(&self) -> crate::proto::PromptMode {
         match self {
             Backend::Tmuxlet(b) => b.prompt_mode,
             Backend::Cli(b) => b.prompt_mode,
-            Backend::Api(_) => crate::openai::PromptMode::Transcript,
+            Backend::Api(_) => crate::proto::PromptMode::Transcript,
         }
     }
 
@@ -544,7 +544,7 @@ order = ["c"]
             tmuxlet_stdin: false,
         };
         let b = Backend::from_config("c", &cfg.backends["c"], &env, &defaults);
-        assert_eq!(b.prompt_mode(), crate::openai::PromptMode::Transcript);
+        assert_eq!(b.prompt_mode(), crate::proto::PromptMode::Transcript);
     }
 
     #[test]

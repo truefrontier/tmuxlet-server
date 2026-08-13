@@ -192,7 +192,7 @@ mod tests {
             env_pass: None,
             stdin_prompt: false,
             max_concurrent: None,
-            prompt_mode: crate::openai::PromptMode::Transcript,
+            prompt_mode: crate::proto::PromptMode::Transcript,
         }
     }
 

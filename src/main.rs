@@ -2,12 +2,14 @@ mod auth;
 mod backend;
 mod config;
 mod env;
+mod exec;
 mod http;
 mod http_client;
 mod log;
-mod openai;
+mod proto;
 mod pty;
-mod router;
+mod route;
+mod stats;
 
 use backend::Backend;
 use config::Config;
@@ -16,7 +18,7 @@ use std::collections::HashMap;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::ExitCode;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tiny_http::Server;
 
@@ -50,7 +52,9 @@ fn main() -> ExitCode {
                 print_help();
                 return ExitCode::SUCCESS;
             }
-            "--validate" => args.validate = true,
+            // §10: --dry-run is an alias, purely for muscle-memory parity with
+            // the neighbouring tmuxlet CLI.
+            "--validate" | "--dry-run" => args.validate = true,
             "--check-backends" => args.check_backends = true,
             "--allow-remote-unauthenticated" => args.allow_remote = true,
             "--config" => {
@@ -366,21 +370,28 @@ fn run_serve(config_path: &str, allow_remote: bool) -> ExitCode {
             cores.max(16)
         })
         .max(1);
-    let state = Arc::new(http::State {
+    let sessions = Arc::new(route::session::SessionStore::new(
+        cfg.server.session_max,
+        cfg.server.session_ttl_secs,
+    ));
+    let state = Arc::new(http::State::new(
         cfg,
-        env: environment,
+        environment,
         backends,
         auth_token,
-        redact_errors: !loopback,
-        health: Mutex::new(HashMap::new()),
-        active: Mutex::new(HashMap::new()),
-    });
+        !loopback,
+        // U-22: the counters and the session map are built here and handed in as
+        // sibling Arcs, so a future SIGHUP reload can rebuild State around them
+        // instead of dropping every conversation's affinity on the floor.
+        Arc::new(stats::Stats::new()),
+        sessions,
+    ));
     http::serve(server, state, workers);
     ExitCode::SUCCESS
 }
 
 fn print_help() {
     println!(
-        "tmuxlet-server {VERSION}\n\nUsage:\n  tmuxlet-server [--config FILE]    Start the server (default config: {DEFAULT_CONFIG})\n  tmuxlet-server --validate         Validate config (strict) and exit\n  tmuxlet-server --check-backends   Probe each backend's reachability and exit\n  tmuxlet-server --version          Print version\n  tmuxlet-server --help             Print this help\n\nConfig is TOML at {DEFAULT_CONFIG} (override with --config FILE or --config=FILE).\nA fresh config listens on {DEFAULT_LISTEN}. Set `auth = true` for a bearer token\n(written to ~/.tmuxlet/token); --allow-remote-unauthenticated permits a\nnon-loopback bind without auth."
+        "tmuxlet-server {VERSION}\n\nUsage:\n  tmuxlet-server [--config FILE]    Start the server (default config: {DEFAULT_CONFIG})\n  tmuxlet-server --validate         Validate config (strict) and exit\n  tmuxlet-server --dry-run          Alias for --validate\n  tmuxlet-server --check-backends   Probe each backend's reachability and exit\n  tmuxlet-server --version          Print version\n  tmuxlet-server --help             Print this help\n\nConfig is TOML at {DEFAULT_CONFIG} (override with --config FILE or --config=FILE).\nA fresh config listens on {DEFAULT_LISTEN}. Set `auth = true` for a bearer token\n(written to ~/.tmuxlet/token); --allow-remote-unauthenticated permits a\nnon-loopback bind without auth."
     );
 }

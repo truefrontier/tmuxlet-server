@@ -305,9 +305,11 @@ order = ["echo"]
 }
 
 #[test]
-fn route_header_names_the_winning_backend() {
-    // B1: x-tmuxlet-route is class/chain/backend — the third segment names the
-    // fallback leg that actually answered (unrecoverable from the body).
+fn route_header_names_the_model_class_target_and_winning_backend() {
+    // B1 + §5.1: x-tmuxlet-route was `class/target/backend`; the decision layer
+    // widens it to `model/class/target/backend` and emits it on every response,
+    // not just router ones. The last segment still names the leg that actually
+    // answered, which is unrecoverable from the body.
     let server = common::start(&router_config(common::free_port()));
     let (status, headers, body) = common::post_headers(
         &format!("{}/v1/chat/completions", server.base),
@@ -317,15 +319,48 @@ fn route_header_names_the_winning_backend() {
     let route = headers
         .get("x-tmuxlet-route")
         .expect("x-tmuxlet-route must be present on a router request");
-    let segs: Vec<&str> = route.split('/').collect();
     assert_eq!(
-        segs.len(),
-        3,
-        "route must be class/chain/backend, got '{route}'"
+        route, "smart/only/default/echo",
+        "route must be model/class/target/backend"
+    );
+    // §5.1: the three companion headers ship on every response too.
+    assert_eq!(
+        headers.get("x-tmuxlet-backend").map(String::as_str),
+        Some("echo")
+    );
+    assert!(
+        matches!(
+            headers.get("x-tmuxlet-decision").map(String::as_str),
+            Some("classifier") | Some("fall_open")
+        ),
+        "decision header: {:?}",
+        headers.get("x-tmuxlet-decision")
+    );
+    assert!(
+        headers.contains_key("x-tmuxlet-rationale"),
+        "a loopback bind is not redacted, so the rationale ships"
+    );
+}
+
+#[test]
+fn a_plain_chain_request_also_carries_provenance() {
+    // §5.1: V1 emitted x-tmuxlet-route only on the router path, so a direct chain
+    // request came back with no clue which backend had answered.
+    let server = common::start(&config(common::free_port()));
+    let (status, headers, body) = common::post_headers(
+        &format!("{}/v1/chat/completions", server.base),
+        r#"{"model":"default","messages":[{"role":"user","content":"hi"}]}"#,
+    );
+    assert_eq!(status, 200, "body: {body}");
+    assert_eq!(
+        headers.get("x-tmuxlet-route").map(String::as_str),
+        Some("default/echo"),
+        "a direct chain has no class/target, so it is model/backend"
     );
     assert_eq!(
-        segs[2], "echo",
-        "third segment must name the winning backend: '{route}'"
+        headers.get("x-tmuxlet-decision").map(String::as_str),
+        Some("static"),
+        "the model named a chain"
     );
 }
 

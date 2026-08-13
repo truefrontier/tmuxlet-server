@@ -81,6 +81,13 @@ order = ["claude-thinking", "agy"]
 #                                   #   of an agent run is "yes, continue".
 #                                   #   Server-wide (the only classifier key that
 #                                   #   is not per-router); false = v0.2.0 behavior.
+# metrics = false                   # §5.3: expose /metrics (Prometheus text 0.0.4).
+#                                   #   Off by default; gated by `auth` like /v1/*.
+# session_max = 4096                # §6.2: hard cap on the session map. A client-
+#                                   #   supplied session header keying an unbounded
+#                                   #   map is a memory-exhaustion vector, so the
+#                                   #   oldest entry is evicted at the limit.
+# session_ttl_secs = 7200           # §6.2: how long session state survives idle
 
 # ── Per-backend optional keys ───────────────────────────────────────────────
 # All backend types:
@@ -119,6 +126,14 @@ order = ["claude-thinking", "agy"]
 #   classifier_max_chars = 4000     # budget for the whole classifier input (see
 #                                   #   classifier_include_opening in [server] above), in chars
 #   classifier_prompt = "..."       # override the default classify prompt ({classes}/{input})
+#   session_affinity = true         # §6.3: reuse this conversation's first decision
+#                                   #   on later turns and skip the classifier call.
+#                                   #   Engages only when the client sends one of:
+#                                   #   x-tmuxlet-session-id, x-claude-code-session-id,
+#                                   #   x-session-id, x-conversation-id
+#   message_hash_fallback = false   # §6.1: with no session header, key on a hash of
+#                                   #   the opening user message. Opt-in: it collides
+#                                   #   across conversations that open identically.
 #   [routers.smart.routes]          # class -> chain or backend
 #   research = "thinking"
 #   execution = "default"

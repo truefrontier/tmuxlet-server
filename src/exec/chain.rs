@@ -1,0 +1,454 @@
+//! `run_chain` and the per-backend health it reads and writes.
+
+use crate::backend::{BackendError, DispatchResult};
+use crate::http::State;
+use crate::log;
+use crate::proto::PromptMode;
+use crate::route::session::SessionKey;
+use crate::stats::Outcome;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// P-9 / U-13: per-backend health, updated after each dispatch.
+#[derive(Default, Clone)]
+pub struct BackendHealth {
+    pub consecutive_failures: u32,
+    pub cooling_until: Option<Instant>,
+    pub last_error: Option<String>,
+    pub last_latency_ms: Option<u64>,
+}
+
+/// U-20: RAII guard for a `state.active` concurrency slot. `try_acquire`
+/// increments the in-flight count under the backend's cap (returning `None` when
+/// already at the cap); `Drop` decrements it. Because the server is built to
+/// survive dispatch panics (F-3 `catch_unwind` in `serve`), this guard is what
+/// keeps a panic between acquire and release from leaking the slot forever — one
+/// leak would brick a `max_concurrent = 1` backend until restart.
+pub struct ActiveSlot<'a> {
+    active: &'a Mutex<HashMap<String, usize>>,
+    name: String,
+}
+
+impl<'a> ActiveSlot<'a> {
+    /// Reserve one slot for `name` under `max`. `None` if already at capacity.
+    pub fn try_acquire(
+        active: &'a Mutex<HashMap<String, usize>>,
+        name: &str,
+        max: usize,
+    ) -> Option<Self> {
+        let mut counts = active.lock().unwrap();
+        let count = counts.entry(name.to_string()).or_insert(0);
+        if *count >= max {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            active,
+            name: name.to_string(),
+        })
+    }
+}
+
+impl Drop for ActiveSlot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.active.lock()
+            && let Some(c) = counts.get_mut(&self.name)
+        {
+            *c = c.saturating_sub(1);
+        }
+    }
+}
+
+/// Everything one chain walk needs. A struct rather than eight positional
+/// arguments, because the streaming path builds it on a different thread and the
+/// order of five `&str`s is not something a reader should have to hold.
+pub struct ChainCtx<'a> {
+    pub legs: &'a [&'a str],
+    pub prompt: &'a str,
+    pub last_user: &'a str,
+    pub raw: &'a serde_json::Value,
+    pub default_to: Duration,
+    pub reqid: &'a str,
+    /// §6.3: when present, backends this conversation has already overflowed are
+    /// skipped, and a fresh overflow is recorded against it.
+    pub session: Option<&'a SessionKey>,
+}
+
+/// Walk the chain with P-9 cooldown, P-6 budget, and U-20 concurrency. Returns
+/// the winning result or every leg's error.
+pub fn run(state: &State, ctx: &ChainCtx) -> Result<(DispatchResult, String), Vec<BackendError>> {
+    let ChainCtx {
+        legs: names,
+        prompt,
+        last_user,
+        raw: raw_value,
+        default_to,
+        reqid,
+        session,
+    } = *ctx;
+    let cooldown_on = state.cfg.server.cooldown;
+    // §6.3: an overflow exclusion is per-conversation and permanent for that
+    // conversation's life — the prompt only grows, so a leg that could not fit it
+    // on turn 5 will not fit it on turn 6.
+    let excluded = session
+        .and_then(|k| state.sessions.get(k))
+        .map(|st| st.excluded)
+        .unwrap_or_default();
+    let start = Instant::now();
+    let budget_deadline = state
+        .cfg
+        .server
+        .chain_budget_secs
+        // checked_add: an absurd budget would overflow Instant; treat as unbounded.
+        .and_then(|b| start.checked_add(Duration::from_secs(b)));
+
+    // P-9: snapshot cooling status per candidate.
+    let cooling: Vec<Option<Duration>> = names
+        .iter()
+        .map(|&n| {
+            if !cooldown_on {
+                return None;
+            }
+            let h = state.health.lock().unwrap();
+            h.get(n)
+                .and_then(|hh| hh.cooling_until)
+                .and_then(|u| u.checked_duration_since(start))
+        })
+        .collect();
+
+    let mut errors: Vec<BackendError> = Vec::new();
+    for (i, &name) in names.iter().enumerate() {
+        // P-6: budget exhausted — skip the rest.
+        if let Some(dl) = budget_deadline
+            && Instant::now() >= dl
+        {
+            errors.push(BackendError::Backend(
+                name.to_string(),
+                "skipped: budget".into(),
+            ));
+            log::debug(&format!("{reqid} skip backend={name}: budget exhausted"));
+            continue;
+        }
+        // P-9: skip a cooling leg only if a non-cooling leg remains ahead.
+        if let Some(remaining) = cooling[i] {
+            let non_cooling_ahead = cooling[i + 1..].iter().any(|c| c.is_none());
+            if non_cooling_ahead {
+                let secs = remaining.as_secs();
+                errors.push(BackendError::Backend(
+                    name.to_string(),
+                    format!("skipped: cooling {secs}s"),
+                ));
+                log::debug(&format!("{reqid} skip backend={name}: cooling {secs}s"));
+                continue;
+            }
+        }
+        // §6.3: this conversation already proved the prompt does not fit here.
+        if excluded.contains(name) {
+            errors.push(BackendError::Backend(
+                name.to_string(),
+                "skipped: context overflow earlier this session".into(),
+            ));
+            log::debug(&format!("{reqid} skip backend={name}: session overflow"));
+            continue;
+        }
+        let backend = &state.backends[name];
+        // U-20: reserve a concurrency slot (RAII: released on Drop, even on a
+        // dispatch panic). At the cap this leg is Busy and the chain advances.
+        let _slot = match backend.max_concurrent() {
+            Some(max) => match ActiveSlot::try_acquire(&state.active, name, max) {
+                Some(slot) => Some(slot),
+                None => {
+                    errors.push(BackendError::Busy(name.to_string()));
+                    continue;
+                }
+            },
+            None => None,
+        };
+        // P-6: clamp the leg timeout to the remaining budget.
+        let leg_to = backend.timeout_override().unwrap_or(default_to);
+        let timeout = match budget_deadline {
+            Some(dl) => dl.saturating_duration_since(Instant::now()).min(leg_to),
+            None => leg_to,
+        };
+        let leg_start = Instant::now();
+        let leg_prompt = match backend.prompt_mode() {
+            PromptMode::LastUser => last_user,
+            PromptMode::Transcript => prompt,
+        };
+        let result = backend.dispatch(leg_prompt, raw_value, &state.env, timeout);
+        let elapsed_ms = leg_start.elapsed().as_millis() as u64;
+        match result {
+            Ok(res) => {
+                if res.content.trim().is_empty() && !backend.allow_empty() {
+                    let e = BackendError::Backend(name.to_string(), "empty output".into());
+                    record_failure(state, name, &e, elapsed_ms);
+                    log::warn(&format!("{reqid} skip backend={name}: empty output"));
+                    errors.push(e);
+                    continue;
+                }
+                record_success(state, name, elapsed_ms);
+                log::info(&format!(
+                    "{reqid} ok backend={name} elapsed_ms={elapsed_ms}"
+                ));
+                return Ok((res, name.to_string()));
+            }
+            Err(e) => {
+                log::warn(&format!("{reqid} skip backend={name}: {e}"));
+                if let (BackendError::Overflow(..), Some(key)) = (&e, session) {
+                    state.sessions.update(key, |st| {
+                        st.excluded.insert(name.to_string());
+                    });
+                }
+                record_failure(state, name, &e, elapsed_ms);
+                errors.push(e);
+            }
+        }
+    }
+    Err(errors)
+}
+
+pub fn record_success(state: &State, name: &str, latency_ms: u64) {
+    state
+        .stats
+        .record_backend(name, Outcome::Success, latency_ms);
+    let mut h = state.health.lock().unwrap();
+    let e = h.entry(name.to_string()).or_default();
+    e.consecutive_failures = 0;
+    e.cooling_until = None;
+    e.last_error = None;
+    e.last_latency_ms = Some(latency_ms);
+}
+
+pub fn record_failure(state: &State, name: &str, err: &BackendError, latency_ms: u64) {
+    state
+        .stats
+        .record_backend(name, outcome_for(err), latency_ms);
+    if let BackendError::Http(_, 429, _) = err {
+        // §7.5: a 429 is the load-bearing quota signal. Absent an upstream
+        // Retry-After the window is the configured cooldown, not a constant —
+        // an operator who set cooldown_secs = 600 meant it. Phase 6 (P-9) threads
+        // the real Retry-After through here.
+        state.stats.record_rate_limited(
+            name,
+            Some(Duration::from_secs(state.cfg.server.cooldown_secs)),
+        );
+    }
+    // §4.3: a context overflow says nothing about the backend's health — the
+    // backend is fine, the prompt does not fit. Keep it out of the cooldown
+    // bookkeeping entirely, or one long conversation benches a 32k local model
+    // for every short request that follows.
+    if let BackendError::Overflow(..) = err {
+        return record_overflow(state, name, err, latency_ms);
+    }
+    // A4: mutate health under the lock, then RELEASE it before logging. log::line
+    // can block on a stalled stderr pipe; blocking (or, before the log.rs fix,
+    // panicking on EPIPE) while holding state.health would stall or poison the
+    // mutex and brick every later request.
+    let cooldown_log = {
+        let mut h = state.health.lock().unwrap();
+        let e = h.entry(name.to_string()).or_default();
+        e.consecutive_failures = e.consecutive_failures.saturating_add(1);
+        e.last_error = Some(err.to_string());
+        e.last_latency_ms = Some(latency_ms);
+        if state.cfg.server.cooldown {
+            let cd = cooldown_for(err, e.consecutive_failures, state.cfg.server.cooldown_secs);
+            // checked_add: an absurd cooldown_secs would overflow Instant.
+            e.cooling_until = Instant::now().checked_add(cd);
+            Some((cd.as_secs(), err.class()))
+        } else {
+            None
+        }
+    };
+    if let Some((secs, class)) = cooldown_log {
+        log::info(&format!("cooldown {name} for {secs}s ({class})"));
+    }
+}
+
+/// §4.3: record a context overflow without letting it read as ill-health.
+///
+/// `last_error`/`last_latency_ms` still move, so `/v1/backends` can explain why a
+/// leg was skipped. `consecutive_failures` is neither incremented **nor reset**
+/// (plan O4): an overflow is no more evidence of health than of ill-health, and
+/// zeroing the counter would let a chatty client launder a genuinely failing
+/// backend back into rotation. No cooldown is applied.
+fn record_overflow(state: &State, name: &str, err: &BackendError, latency_ms: u64) {
+    let mut h = state.health.lock().unwrap();
+    let e = h.entry(name.to_string()).or_default();
+    e.last_error = Some(err.to_string());
+    e.last_latency_ms = Some(latency_ms);
+}
+
+/// §5.3: the bounded `outcome` label. Retryable means "the same request against
+/// the same backend could plausibly work in a minute"; everything else is
+/// `other_error`, and an overflow is neither.
+pub fn outcome_for(err: &BackendError) -> Outcome {
+    match err {
+        BackendError::Overflow(..) => Outcome::Overflow,
+        BackendError::Timeout(_) | BackendError::Spawn(_, _) | BackendError::Busy(_) => {
+            Outcome::RetryableError
+        }
+        BackendError::Http(_, 429 | 500..=599, _) => Outcome::RetryableError,
+        _ => Outcome::OtherError,
+    }
+}
+
+/// P-9: cooldown scaled by what a wasted retry costs.
+pub fn cooldown_for(err: &BackendError, failures: u32, cooldown_secs: u64) -> Duration {
+    match err {
+        // A retry burns the whole timeout — back off exponentially 30 -> 300s.
+        BackendError::Timeout(_) => {
+            let shift = failures.saturating_sub(1).min(4);
+            Duration::from_secs((30u64 << shift).min(300))
+        }
+        // Connect-refused fails in milliseconds; the "just restarted Ollama"
+        // case must recover fast.
+        BackendError::Spawn(_, msg) if msg.to_ascii_lowercase().contains("refused") => {
+            Duration::from_secs(5)
+        }
+        // 429 / other HTTP: base cooldown (Retry-After not yet threaded through).
+        _ => Duration::from_secs(cooldown_secs),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::State;
+
+    #[test]
+    fn cooldown_scales_with_error_class() {
+        assert_eq!(
+            cooldown_for(&BackendError::Timeout("t".into()), 1, 60).as_secs(),
+            30
+        );
+        assert_eq!(
+            cooldown_for(&BackendError::Timeout("t".into()), 3, 60).as_secs(),
+            120
+        );
+        assert_eq!(
+            cooldown_for(&BackendError::Timeout("t".into()), 9, 60).as_secs(),
+            300
+        );
+        assert_eq!(
+            cooldown_for(
+                &BackendError::Spawn("t".into(), "Connection refused".into()),
+                1,
+                60
+            )
+            .as_secs(),
+            5
+        );
+        assert_eq!(
+            cooldown_for(&BackendError::Http("t".into(), 429, String::new()), 1, 60).as_secs(),
+            60
+        );
+    }
+
+    #[test]
+    fn active_slot_caps_and_frees() {
+        // U-20: the guard blocks a second acquire at cap and frees on Drop.
+        let active = Mutex::new(HashMap::new());
+        let s1 = ActiveSlot::try_acquire(&active, "b", 1);
+        assert!(s1.is_some(), "first acquire under cap succeeds");
+        assert_eq!(*active.lock().unwrap().get("b").unwrap(), 1);
+        assert!(
+            ActiveSlot::try_acquire(&active, "b", 1).is_none(),
+            "second acquire at cap is refused"
+        );
+        drop(s1);
+        assert_eq!(*active.lock().unwrap().get("b").unwrap(), 0);
+        assert!(
+            ActiveSlot::try_acquire(&active, "b", 1).is_some(),
+            "slot is reusable after Drop"
+        );
+    }
+
+    #[test]
+    fn active_slot_releases_on_unwind() {
+        // A2: a panic between acquire and release must not leak the slot (the
+        // server survives dispatch panics via F-3 catch_unwind).
+        let active = Mutex::new(HashMap::new());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _slot = ActiveSlot::try_acquire(&active, "b", 1).unwrap();
+            panic!("boom");
+        }));
+        assert!(r.is_err());
+        assert_eq!(
+            *active.lock().unwrap().get("b").unwrap(),
+            0,
+            "slot must be freed after an unwind"
+        );
+    }
+
+    #[test]
+    fn overflow_does_not_cool_or_count_against_health() {
+        // T14: an overflow must move neither consecutive_failures nor
+        // cooling_until — and the same call with a Timeout must move both, so a
+        // short-circuit that swallowed every error class would fail here.
+        const C: &str = r#"
+[server]
+listen = "127.0.0.1:3456"
+default_chain = "echo"
+env_source = "process"
+cooldown = true
+
+[backends.echo]
+type = "cli"
+bin = "/bin/echo"
+"#;
+        let state = State::for_test(crate::config::parse(C).unwrap());
+        let overflow = BackendError::Overflow("echo".into(), "maximum context length".into());
+        record_failure(&state, "echo", &overflow, 12);
+        {
+            let h = state.health.lock().unwrap();
+            let e = h.get("echo").expect("overflow still records last_error");
+            assert_eq!(e.consecutive_failures, 0, "overflow is not a health signal");
+            assert!(e.cooling_until.is_none(), "overflow must not cool a leg");
+            assert_eq!(e.last_latency_ms, Some(12));
+            assert!(
+                e.last_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("context overflow"),
+                "/v1/backends must still explain the skip: {:?}",
+                e.last_error
+            );
+        }
+        record_failure(&state, "echo", &BackendError::Timeout("echo".into()), 34);
+        let h = state.health.lock().unwrap();
+        let e = h.get("echo").unwrap();
+        assert_eq!(e.consecutive_failures, 1, "a real failure still counts");
+        assert!(e.cooling_until.is_some(), "a real failure still cools");
+    }
+
+    #[test]
+    fn outcome_labels_stay_bounded_and_meaningful() {
+        // §5.3: the /metrics label set is fixed at four values by construction.
+        assert_eq!(
+            outcome_for(&BackendError::Overflow("a".into(), String::new())),
+            Outcome::Overflow
+        );
+        assert_eq!(
+            outcome_for(&BackendError::Timeout("a".into())),
+            Outcome::RetryableError
+        );
+        assert_eq!(
+            outcome_for(&BackendError::Http("a".into(), 429, String::new())),
+            Outcome::RetryableError
+        );
+        assert_eq!(
+            outcome_for(&BackendError::Http("a".into(), 503, String::new())),
+            Outcome::RetryableError
+        );
+        // A 400 is the client's problem; retrying it changes nothing.
+        assert_eq!(
+            outcome_for(&BackendError::Http("a".into(), 400, String::new())),
+            Outcome::OtherError
+        );
+        assert_eq!(
+            outcome_for(&BackendError::Parse("a".into(), String::new())),
+            Outcome::OtherError
+        );
+    }
+}
