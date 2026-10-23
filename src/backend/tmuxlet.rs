@@ -22,32 +22,242 @@ pub fn build_args(b: &TmuxletBackend, prompt: &str, timeout_secs: u64) -> Vec<St
         a.push("--target-arg".into());
         a.push(ta.clone());
     }
+    if b.tools_protocol {
+        a.push("--tools-protocol".into());
+    }
     a.push(prompt.into());
     a
+}
+
+fn parse_emitted_calls(v: Option<&serde_json::Value>) -> Option<Vec<crate::backend::EmittedToolCall>> {
+    let arr = v.and_then(|x| x.as_array())?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for c in arr {
+        let id = c
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let name = c
+            .get("name")
+            .and_then(|x| x.as_str())
+            .or_else(|| {
+                c.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+            })?
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let arguments = match c
+            .get("arguments")
+            .or_else(|| c.get("function").and_then(|f| f.get("arguments")))
+        {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => "{}".into(),
+        };
+        let id = if id.is_empty() {
+            format!("call_{}", out.len())
+        } else {
+            id
+        };
+        out.push(crate::backend::EmittedToolCall {
+            id,
+            name,
+            arguments,
+        });
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Parse tmuxlet's JSON stdout into a `DispatchResult` (text and/or tool_calls).
+pub fn parse_result(name: &str, stdout: &str) -> Result<DispatchResult, BackendError> {
+    let trimmed = stdout.trim();
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(v) => {
+            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            if status != "completed" {
+                return Err(BackendError::Backend(
+                    name.into(),
+                    format!("tmuxlet status={status}"),
+                ));
+            }
+            let content = v
+                .get("output")
+                .and_then(|o| o.as_str())
+                .unwrap_or("")
+                .to_string();
+            let session_held = v
+                .get("sessionHeld")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
+            let run_id = v.get("id").and_then(|x| x.as_str()).map(str::to_string);
+            let mut tool_calls = parse_emitted_calls(v.get("toolCalls"));
+            if tool_calls.is_none() {
+                tool_calls = parse_emitted_calls(v.get("tool_calls"));
+            }
+            if v.get("turnKind").and_then(|x| x.as_str()) != Some("tool_calls")
+                && tool_calls
+                    .as_ref()
+                    .is_none_or(|c| c.is_empty())
+            {
+                tool_calls = None;
+            }
+            Ok(DispatchResult {
+                content,
+                model_label: name.to_string(),
+                tool_calls,
+                session_held,
+                run_id,
+            })
+        }
+        Err(_) => Ok(DispatchResult::text(stdout.to_string(), name.to_string())),
+    }
 }
 
 /// Parse tmuxlet's JSON output. Success iff `status == "completed"` (verified
 /// against tmuxlet 0.3.0 `result_status_code`; deviation #1). Non-JSON stdout
 /// is treated as raw content.
 pub fn parse_output(name: &str, stdout: &str) -> Result<String, BackendError> {
-    let trimmed = stdout.trim();
-    match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(v) => {
-            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
-            if status == "completed" {
-                Ok(v.get("output")
-                    .and_then(|o| o.as_str())
-                    .unwrap_or("")
-                    .to_string())
-            } else {
-                Err(BackendError::Backend(
-                    name.into(),
-                    format!("tmuxlet status={status}"),
-                ))
+    parse_result(name, stdout).map(|r| r.content)
+}
+
+/// Parse a `turn.json` written by `tmuxlet bridge turn` (kind tool_calls | text).
+pub fn parse_turn_file(name: &str, raw: &str) -> Result<DispatchResult, BackendError> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).map_err(|e| {
+        BackendError::Parse(name.into(), format!("turn.json: {e}"))
+    })?;
+    match v.get("kind").and_then(|k| k.as_str()) {
+        Some("tool_calls") => {
+            let calls = parse_emitted_calls(v.get("calls")).ok_or_else(|| {
+                BackendError::Parse(name.into(), "turn.json tool_calls missing calls".into())
+            })?;
+            Ok(DispatchResult {
+                content: String::new(),
+                model_label: name.to_string(),
+                tool_calls: Some(calls),
+                session_held: true,
+                run_id: None,
+            })
+        }
+        Some("text") => Ok(DispatchResult {
+            content: v
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string(),
+            model_label: name.to_string(),
+            tool_calls: None,
+            session_held: true,
+            run_id: None,
+        }),
+        other => Err(BackendError::Parse(
+            name.into(),
+            format!("turn.json unknown kind: {other:?}"),
+        )),
+    }
+}
+
+fn turn_path(env: &Env, run_id: &str) -> std::path::PathBuf {
+    let home = env
+        .get("TMUXLET_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            env.get("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".tmuxlet"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from(".tmuxlet"));
+    home.join("runs").join(run_id).join("turn.json")
+}
+
+fn valid_run_id(run_id: &str) -> bool {
+    !run_id.is_empty()
+        && !run_id.contains('/')
+        && !run_id.contains('\\')
+        && !run_id.contains("..")
+}
+
+/// `tmuxlet send <id> <message>` then wait for the next `turn.json`.
+pub fn continue_turn(
+    b: &TmuxletBackend,
+    run_id: &str,
+    message: &str,
+    env: &Env,
+    timeout: Duration,
+) -> Result<DispatchResult, BackendError> {
+    if !valid_run_id(run_id) {
+        return Err(BackendError::Backend(
+            b.name.clone(),
+            "invalid held run id".into(),
+        ));
+    }
+    let turn = turn_path(env, run_id);
+    let _ = std::fs::remove_file(&turn);
+    let mut child = Command::new(&b.bin)
+        .args(["send", run_id, message])
+        .env_clear()
+        .envs(env.filtered_pairs(b.env_pass.as_deref()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?;
+    let deadline = super::poll_deadline(timeout.saturating_add(Duration::from_secs(5)));
+    loop {
+        match child
+            .try_wait()
+            .map_err(|e| BackendError::Spawn(b.name.clone(), e.to_string()))?
+        {
+            Some(s) => {
+                if !s.success() {
+                    return Err(BackendError::Backend(
+                        b.name.clone(),
+                        format!("tmuxlet send exited {}", s.code().unwrap_or(-1)),
+                    ));
+                }
+                break;
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(BackendError::Timeout(b.name.clone()));
+                }
+                thread::sleep(Duration::from_millis(50));
             }
         }
-        Err(_) => Ok(stdout.to_string()),
     }
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(&turn) {
+            let mut result = parse_turn_file(&b.name, &raw)?;
+            let _ = std::fs::remove_file(&turn);
+            result.session_held = true;
+            result.run_id = Some(run_id.to_string());
+            result.model_label = b.name.clone();
+            return Ok(result);
+        }
+        if Instant::now() >= deadline {
+            return Err(BackendError::Timeout(b.name.clone()));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Kill a held tmuxlet pane (`tmuxlet stop <id>`). Best-effort; eviction must not fail.
+pub fn stop_run(bin: &std::path::Path, run_id: &str) {
+    if !valid_run_id(run_id) {
+        return;
+    }
+    let _ = Command::new(bin).args(["stop", run_id]).status();
 }
 
 /// Spawn `tmuxlet`, draining stdout/stderr on threads, with a watchdog backstop
@@ -132,11 +342,7 @@ pub fn dispatch(
             stderr.lines().last().unwrap_or("").to_string(),
         ));
     }
-    let content = parse_output(&b.name, &stdout)?;
-    Ok(DispatchResult {
-        content,
-        model_label: b.name.clone(),
-    })
+    parse_result(&b.name, &stdout)
 }
 
 #[cfg(test)]
@@ -156,6 +362,7 @@ mod tests {
             use_stdin: false,
             max_concurrent: None,
             prompt_mode: crate::proto::PromptMode::Transcript,
+            tools_protocol: false,
         }
     }
 
@@ -198,5 +405,32 @@ mod tests {
     #[test]
     fn non_json_falls_back_to_raw() {
         assert_eq!(parse_output("t", "just text").unwrap(), "just text");
+    }
+
+    #[test]
+    fn parse_result_reads_tool_calls_and_held_session() {
+        let j = r#"{"id":"r9","status":"completed","output":"","sessionHeld":true,"turnKind":"tool_calls","toolCalls":[{"id":"c1","name":"bash","arguments":{"command":"ls"}}]}"#;
+        let r = parse_result("t", j).unwrap();
+        assert!(r.session_held);
+        assert_eq!(r.run_id.as_deref(), Some("r9"));
+        let calls = r.tool_calls.expect("tool_calls");
+        assert_eq!(calls[0].name, "bash");
+        assert!(calls[0].arguments.contains("ls"));
+    }
+
+    #[test]
+    fn parse_turn_file_reads_text_kind() {
+        let r = parse_turn_file("t", r#"{"kind":"text","content":"hi"}"#).unwrap();
+        assert_eq!(r.content, "hi");
+        assert!(r.session_held);
+        assert!(r.tool_calls.is_none());
+    }
+
+    #[test]
+    fn assembles_args_with_tools_protocol() {
+        let mut b = b();
+        b.tools_protocol = true;
+        let a = build_args(&b, "hello", 30);
+        assert!(a.iter().any(|x| x == "--tools-protocol"));
     }
 }

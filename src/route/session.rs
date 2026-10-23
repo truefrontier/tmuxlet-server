@@ -9,6 +9,8 @@ use super::DecisionSource;
 use crate::proto::openai::ChatMessage;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -111,7 +113,23 @@ pub struct SessionState {
     /// §8: once the judge has confirmed, later turns skip both the cheap leg and
     /// the judge. Names the leg that was escalated *past*.
     pub latched: Option<String>,
+    /// Held tmuxlet pane for the OpenAI tools protocol. Eviction/TTL must `tmuxlet stop` it.
+    pub held_run: Option<HeldTmuxletRun>,
     last_seen: Instant,
+}
+
+/// A live `tmuxlet -p --tools-protocol` pane owned by this conversation.
+#[derive(Clone, Debug)]
+pub struct HeldTmuxletRun {
+    pub run_id: String,
+    pub backend: String,
+    pub bin: PathBuf,
+}
+
+impl HeldTmuxletRun {
+    pub fn stop(&self) {
+        let _ = Command::new(&self.bin).args(["stop", &self.run_id]).status();
+    }
 }
 
 impl SessionState {
@@ -121,6 +139,7 @@ impl SessionState {
             excluded: HashSet::new(),
             escalate_streak: 0,
             latched: None,
+            held_run: None,
             last_seen: now,
         }
     }
@@ -190,7 +209,15 @@ impl SessionStore {
         now: Instant,
         incoming: &SessionKey,
     ) {
-        m.retain(|_, st| now.duration_since(st.last_seen) <= self.ttl);
+        m.retain(|_, st| {
+            let keep = now.duration_since(st.last_seen) <= self.ttl;
+            if !keep {
+                if let Some(run) = st.held_run.take() {
+                    run.stop();
+                }
+            }
+            keep
+        });
         if m.contains_key(incoming) {
             return;
         }
@@ -202,7 +229,11 @@ impl SessionStore {
             else {
                 break;
             };
-            m.remove(&oldest);
+            if let Some(mut st) = m.remove(&oldest) {
+                if let Some(run) = st.held_run.take() {
+                    run.stop();
+                }
+            }
         }
     }
 
@@ -212,6 +243,18 @@ impl SessionStore {
     /// allocation that can fail observably), so there is no torn state to fear.
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<SessionKey, SessionState>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How many conversations currently hold a live pane on `backend`.
+    pub fn held_count_for(&self, backend: &str) -> usize {
+        self.lock()
+            .values()
+            .filter(|st| {
+                st.held_run
+                    .as_ref()
+                    .is_some_and(|h| h.backend == backend)
+            })
+            .count()
     }
 }
 
@@ -394,5 +437,22 @@ mod tests {
             SessionKey::MessageHash(0xdead).label(),
             "hash-000000000000dead"
         );
+    }
+
+    #[test]
+    fn held_run_is_stopped_on_ttl_eviction() {
+        let s = SessionStore::new(1, 7200);
+        let k = SessionKey::Header("dsh-1".into());
+        s.update(&k, |st| {
+            st.held_run = Some(HeldTmuxletRun {
+                run_id: "abc".into(),
+                backend: "grok".into(),
+                bin: std::path::PathBuf::from("/usr/bin/true"),
+            });
+        });
+        assert_eq!(s.held_count_for("grok"), 1);
+        s.update(&SessionKey::Header("other".into()), |_| {});
+        assert_eq!(s.len(), 1, "hard cap should evict the held session");
+        assert_eq!(s.held_count_for("grok"), 0);
     }
 }

@@ -3,7 +3,7 @@
 //! Everything about *which* backend answers lives in `route/`; everything about
 //! *running* it lives in `exec/`. What is left here is the wire.
 
-use crate::backend::{Backend, BackendError};
+use crate::backend::{Backend, BackendError, DispatchResult};
 use crate::config::Config;
 use crate::env::Env;
 pub use crate::exec::chain::BackendHealth;
@@ -699,6 +699,24 @@ fn decision_headers(
     h
 }
 
+fn openai_completion_json(result: &DispatchResult) -> String {
+    let calls: Option<Vec<(String, String, String)>> = result.tool_calls.as_ref().map(|v| {
+        v.iter()
+            .map(|c| (c.id.clone(), c.name.clone(), c.arguments.clone()))
+            .collect()
+    });
+    serde_json::to_string(&openai::build_completion_with_tools(
+        format!("chatcmpl-{}", result.model_label),
+        result.model_label.clone(),
+        if result.content.is_empty() {
+            None
+        } else {
+            Some(result.content.clone())
+        },
+        calls.as_deref(),
+    ))
+    .expect("completion serializes")
+}
 fn handle_chat(
     req: Request,
     raw: &str,
@@ -805,6 +823,24 @@ fn handle_chat(
     }
     state.stats.record_decision(decision.source.as_str());
 
+    if openai::request_has_tools(&raw_value) {
+        let capable = decision.legs.iter().any(|n| {
+            state
+                .backends
+                .get(n)
+                .is_some_and(|b| b.tools_protocol())
+        });
+        if !capable {
+            return respond_err_shaped(
+                req,
+                anthropic_shape,
+                400,
+                "this chain cannot emit tool_calls: set tools_protocol = true on a tmuxlet backend, or use an api backend. Tools were previously ignored; that is no longer the case.",
+                "invalid_request_error",
+                Some("tools_not_supported"),
+            );
+        }
+    }
     // §8: the gate belongs to the chain the decision landed on, not to the model
     // the client asked for — a router's classes can point at chains with
     // different gates.
@@ -864,17 +900,12 @@ fn handle_chat(
             let body = if anthropic_shape {
                 anthropic::build_message(
                     format!("msg_{}", result.model_label),
-                    result.model_label,
-                    result.content,
+                    result.model_label.clone(),
+                    result.content.clone(),
                 )
                 .to_string()
             } else {
-                serde_json::to_string(&openai::build_completion(
-                    format!("chatcmpl-{}", result.model_label),
-                    result.model_label,
-                    result.content,
-                ))
-                .unwrap()
+                openai_completion_json(&result)
             };
             let mut resp = Response::from_string(body)
                 .with_header(header("Content-Type", "application/json"))
@@ -1132,9 +1163,17 @@ fn stream_with_keepalive(
                         }
                     }
                 } else {
-                    // A blocking backend (tmuxlet/cli, permanently — the child
-                    // emits at exit) still emits the whole reply at once.
-                    for f in openai::stream_frames(&id, &result.model_label, &result.content) {
+                    let frames = match &result.tool_calls {
+                        Some(calls) if !calls.is_empty() => {
+                            let tuples: Vec<(String, String, String)> = calls
+                                .iter()
+                                .map(|c| (c.id.clone(), c.name.clone(), c.arguments.clone()))
+                                .collect();
+                            openai::stream_frames_with_tools(&id, &result.model_label, &tuples)
+                        }
+                        _ => openai::stream_frames(&id, &result.model_label, &result.content),
+                    };
+                    for f in frames {
                         if tx.send(f.into_bytes()).is_err() {
                             return;
                         }

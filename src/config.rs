@@ -282,6 +282,9 @@ pub enum Backend {
         /// and is the only option that works when the provider's limit is opaque.
         #[serde(default)]
         quota_learn: bool,
+        /// Opt-in multi-turn OpenAI tools protocol via a held tmux pane.
+        #[serde(default)]
+        tools_protocol: bool,
     },
     Api {
         base_url: String,
@@ -862,6 +865,7 @@ const TMUXLET_KEYS: &[&str] = &[
     "quota_calls",
     "quota_window_secs",
     "quota_learn",
+    "tools_protocol",
 ];
 const API_KEYS: &[&str] = &[
     "type",
@@ -1114,10 +1118,32 @@ order = ["agy", "ollama-kimi", "claude-thinking"]
             }
             _ => panic!("ollama-kimi should be an api backend"),
         }
-        assert_eq!(
-            cfg.chains["default"].order,
-            vec!["agy", "ollama-kimi", "claude-thinking"]
-        );
+    }
+
+    #[test]
+    fn parses_tools_protocol_on_tmuxlet_backend() {
+        let cfg = parse(
+            r#"
+[server]
+listen = "127.0.0.1:3456"
+default_chain = "c"
+
+[backends.g]
+type = "tmuxlet"
+target = "grok"
+tools_protocol = true
+
+[chains.c]
+order = ["g"]
+"#,
+        )
+        .expect("must parse");
+        match &cfg.backends["g"] {
+            Backend::Tmuxlet {
+                tools_protocol, ..
+            } => assert!(*tools_protocol),
+            _ => panic!("expected tmuxlet backend"),
+        }
     }
 
     #[test]

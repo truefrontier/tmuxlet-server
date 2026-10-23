@@ -65,6 +65,80 @@ pub fn extract_content(name: &str, resp: &str) -> Result<String, BackendError> {
         .ok_or_else(|| BackendError::Parse(name.into(), "no choices[0].message.content".into()))
 }
 
+fn parse_openai_tool_calls(v: Option<&serde_json::Value>) -> Option<Vec<super::EmittedToolCall>> {
+    let arr = v.and_then(|x| x.as_array())?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for c in arr {
+        let id = c
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let func = c.get("function")?;
+        let name = func.get("name").and_then(|n| n.as_str())?.to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let arguments = match func.get("arguments") {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+            None => "{}".into(),
+        };
+        let id = if id.is_empty() {
+            format!("call_{}", out.len())
+        } else {
+            id
+        };
+        out.push(super::EmittedToolCall {
+            id,
+            name,
+            arguments,
+        });
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Extract text and/or `tool_calls` from an OpenAI chat completion body.
+/// `content: null` plus tool_calls is success, not a parse error.
+pub fn extract_result(name: &str, resp: &str) -> Result<DispatchResult, BackendError> {
+    let v: serde_json::Value =
+        serde_json::from_str(resp).map_err(|e| BackendError::Parse(name.into(), e.to_string()))?;
+    let message = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .ok_or_else(|| {
+            BackendError::Parse(name.into(), "no choices[0].message".into())
+        })?;
+    let tool_calls = parse_openai_tool_calls(message.get("tool_calls"));
+    let content_val = message.get("content");
+    let content = match content_val {
+        None => None,
+        Some(c) if c.is_null() => None,
+        Some(c) => c.as_str().map(str::to_string),
+    };
+    if let Some(calls) = tool_calls {
+        return Ok(DispatchResult {
+            content: content.unwrap_or_default(),
+            model_label: name.to_string(),
+            tool_calls: Some(calls),
+            session_held: false,
+            run_id: None,
+        });
+    }
+    let content = content.ok_or_else(|| {
+        BackendError::Parse(name.into(), "no choices[0].message.content".into())
+    })?;
+    Ok(DispatchResult::text(content, name.to_string()))
+}
+
 /// U-7: condense an upstream error body to a single-line, control-stripped
 /// snippet (first 300 chars) so the user sees the upstream's actual message
 /// ("invalid key", "out of credits", "unknown model") instead of a bare status.
@@ -138,11 +212,9 @@ pub fn dispatch(
         }
         return Err(BackendError::Http(b.name.clone(), status, detail));
     }
-    let content = extract_content(&b.name, &resp)?;
-    Ok(DispatchResult {
-        content,
-        model_label: b.model.clone(),
-    })
+    let mut result = extract_result(&b.name, &resp)?;
+    result.model_label = b.model.clone();
+    Ok(result)
 }
 
 /// §9.2: dispatch with `stream: true` upstream and relay deltas as they arrive.
@@ -241,10 +313,7 @@ pub fn dispatch_stream(
         }
         return Err(BackendError::Http(b.name.clone(), status, detail));
     }
-    Ok(DispatchResult {
-        content,
-        model_label: b.model.clone(),
-    })
+    Ok(DispatchResult::text(content, b.model.clone()))
 }
 
 /// Find the end of the first complete SSE frame: `(offset, separator length)`.
@@ -359,6 +428,17 @@ mod tests {
     fn extracts_content_from_completion() {
         let r = r#"{"choices":[{"message":{"content":"hello"}}]}"#;
         assert_eq!(extract_content("api", r).unwrap(), "hello");
+    }
+
+    #[test]
+    fn extract_result_accepts_null_content_with_tool_calls() {
+        let r = r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]}}]}"#;
+        let got = extract_result("api", r).unwrap();
+        let calls = got.tool_calls.expect("tool_calls");
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].name, "bash");
+        assert!(calls[0].arguments.contains("ls"));
+        assert!(extract_content("api", r).is_err());
     }
 
     #[test]

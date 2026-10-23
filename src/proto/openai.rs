@@ -168,6 +168,75 @@ pub fn last_user_prompt(messages: &[ChatMessage]) -> String {
     parts.join("\n\n")
 }
 
+/// True when the OpenAI body carries a non-empty `tools` array.
+pub fn request_has_tools(raw: &serde_json::Value) -> bool {
+    raw.get("tools")
+        .and_then(|t| t.as_array())
+        .is_some_and(|a| !a.is_empty())
+}
+
+/// Schemas to paste into a tmuxlet tools-protocol prompt.
+pub fn tools_appendix_from_raw(raw: &serde_json::Value) -> Option<String> {
+    let tools = raw.get("tools")?;
+    let arr = tools.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let pretty = serde_json::to_string_pretty(tools).ok()?;
+    Some(format!(
+        "\n\nAvailable tools (JSON schemas). You are a completion model: do not use your own Bash/Edit/Read. Emit tool_calls or text through the tmuxlet turn protocol.\n{pretty}"
+    ))
+}
+
+fn json_content_text(content: &serde_json::Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = content.as_array() {
+        return arr
+            .iter()
+            .filter_map(|p| {
+                if p.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    p.get("text").and_then(|t| t.as_str()).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    String::new()
+}
+
+/// Text to `tmuxlet send` on a held pane: trailing tool results, else last user.
+pub fn continuation_text_from_raw(raw: &serde_json::Value) -> String {
+    let Some(msgs) = raw.get("messages").and_then(|m| m.as_array()) else {
+        return String::new();
+    };
+    let mut tools = Vec::new();
+    for m in msgs.iter().rev() {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role == "tool" || role == "function" {
+            tools.push(format!(
+                "Tool result:\n{}",
+                json_content_text(m.get("content").unwrap_or(&serde_json::Value::Null))
+            ));
+        } else {
+            break;
+        }
+    }
+    if !tools.is_empty() {
+        tools.reverse();
+        return tools.join("\n\n");
+    }
+    for m in msgs.iter().rev() {
+        if m.get("role").and_then(|r| r.as_str()) == Some("user") {
+            return json_content_text(m.get("content").unwrap_or(&serde_json::Value::Null));
+        }
+    }
+    String::new()
+}
+
 // ---------- Non-streaming response ----------
 #[derive(Debug, Serialize)]
 pub struct ChatCompletion {
@@ -189,7 +258,24 @@ pub struct Choice {
 #[derive(Debug, Serialize)]
 pub struct ResponseMessage {
     pub role: &'static str,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ResponseToolCall>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResponseToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub r#type: &'static str,
+    pub function: ResponseFunction,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResponseFunction {
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -207,6 +293,31 @@ fn unix_now() -> u64 {
 }
 
 pub fn build_completion(id: String, model: String, content: String) -> ChatCompletion {
+    build_completion_with_tools(id, model, Some(content), None)
+}
+
+fn response_tool_calls(calls: &[(String, String, String)]) -> Vec<ResponseToolCall> {
+    calls
+        .iter()
+        .map(|(id, name, arguments)| ResponseToolCall {
+            id: id.clone(),
+            r#type: "function",
+            function: ResponseFunction {
+                name: name.clone(),
+                arguments: arguments.clone(),
+            },
+        })
+        .collect()
+}
+
+/// OpenAI completion for a text reply and/or `tool_calls`.
+pub fn build_completion_with_tools(
+    id: String,
+    model: String,
+    content: Option<String>,
+    tool_calls: Option<&[(String, String, String)]>,
+) -> ChatCompletion {
+    let has_tools = tool_calls.is_some_and(|c| !c.is_empty());
     ChatCompletion {
         id,
         object: "chat.completion",
@@ -216,9 +327,22 @@ pub fn build_completion(id: String, model: String, content: String) -> ChatCompl
             index: 0,
             message: ResponseMessage {
                 role: "assistant",
-                content,
+                content: if has_tools && content.as_ref().is_none_or(|s| s.is_empty()) {
+                    None
+                } else {
+                    content
+                },
+                tool_calls: if has_tools {
+                    Some(response_tool_calls(tool_calls.unwrap_or(&[])))
+                } else {
+                    None
+                },
             },
-            finish_reason: "stop".into(),
+            finish_reason: if has_tools {
+                "tool_calls".into()
+            } else {
+                "stop".into()
+            },
         }],
         usage: Usage {
             prompt_tokens: 0,
@@ -360,6 +484,49 @@ pub fn stream_frames(id: &str, model: &str, content: &str) -> Vec<String> {
             },
             finish_reason: Some("stop".into()),
         }),
+        "data: [DONE]\n\n".to_string(),
+    ]
+}
+
+/// Buffered SSE for a `tool_calls` turn. Text streaming stays on `stream_frames`.
+pub fn stream_frames_with_tools(
+    id: &str,
+    model: &str,
+    calls: &[(String, String, String)],
+) -> Vec<String> {
+    let created = unix_now();
+    let tool_calls: Vec<serde_json::Value> = calls
+        .iter()
+        .enumerate()
+        .map(|(i, (call_id, name, arguments))| {
+            serde_json::json!({
+                "index": i,
+                "id": call_id,
+                "type": "function",
+                "function": { "name": name, "arguments": arguments }
+            })
+        })
+        .collect();
+    let frame = |delta: serde_json::Value, finish: Option<&str>| {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": finish
+                }]
+            })
+        )
+    };
+    vec![
+        frame(serde_json::json!({"role": "assistant"}), None),
+        frame(serde_json::json!({"tool_calls": tool_calls}), None),
+        frame(serde_json::json!({}), Some("tool_calls")),
         "data: [DONE]\n\n".to_string(),
     ]
 }
@@ -544,5 +711,36 @@ mod tests {
         let j = serde_json::to_string(&c).unwrap();
         assert!(j.contains(r#""object":"chat.completion""#));
         assert!(j.contains(r#""usage""#));
+    }
+
+    #[test]
+    fn completion_with_tools_sets_finish_reason() {
+        let calls = vec![(
+            "c1".into(),
+            "bash".into(),
+            r#"{"command":"ls"}"#.into(),
+        )];
+        let c = build_completion_with_tools("id1".into(), "grok".into(), None, Some(&calls));
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains(r#""finish_reason":"tool_calls""#));
+        assert!(j.contains(r#""name":"bash""#));
+        assert!(j.contains("command"));
+    }
+
+    #[test]
+    fn continuation_text_prefers_trailing_tool_results() {
+        let raw: serde_json::Value = serde_json::from_str(
+            r#"{"messages":[
+                {"role":"user","content":"list files"},
+                {"role":"assistant","content":null},
+                {"role":"tool","content":"a.txt"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(continuation_text_from_raw(&raw), "Tool result:\na.txt");
+        assert!(request_has_tools(
+            &serde_json::json!({"tools":[{"type":"function"}]})
+        ));
+        assert!(!request_has_tools(&serde_json::json!({"tools":[]})));
     }
 }

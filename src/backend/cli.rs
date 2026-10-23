@@ -169,10 +169,7 @@ pub fn dispatch(
         }
         cleaned
     };
-    Ok(DispatchResult {
-        content,
-        model_label: b.name.clone(),
-    })
+    Ok(DispatchResult::text(content, b.name.clone()))
 }
 
 #[cfg(test)]

@@ -8,10 +8,32 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmittedToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct DispatchResult {
     pub content: String,
     pub model_label: String,
+    pub tool_calls: Option<Vec<EmittedToolCall>>,
+    pub session_held: bool,
+    pub run_id: Option<String>,
+}
+
+impl DispatchResult {
+    pub fn text(content: String, model_label: String) -> Self {
+        Self {
+            content,
+            model_label,
+            tool_calls: None,
+            session_held: false,
+            run_id: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -154,6 +176,8 @@ pub struct TmuxletBackend {
     pub max_concurrent: Option<usize>,
     /// U-14: prompt shaping mode.
     pub prompt_mode: crate::proto::PromptMode,
+    /// Held-pane OpenAI tools protocol (`tmuxlet -p --tools-protocol`).
+    pub tools_protocol: bool,
 }
 
 pub struct ApiBackend {
@@ -277,8 +301,7 @@ impl Backend {
                 env_pass,
                 max_concurrent,
                 prompt_mode,
-                // §7.3-7.5 economics are read from config by the router, not
-                // baked into the runtime backend.
+                tools_protocol,
                 ..
             } => Backend::Tmuxlet(TmuxletBackend {
                 name: name.into(),
@@ -294,6 +317,7 @@ impl Backend {
                     .as_deref()
                     .and_then(crate::proto::PromptMode::parse)
                     .unwrap_or_default(),
+                tools_protocol: *tools_protocol,
             }),
             config::Backend::Api {
                 base_url,
@@ -423,6 +447,16 @@ impl Backend {
             Backend::Tmuxlet(b) => b.prompt_mode,
             Backend::Cli(b) => b.prompt_mode,
             Backend::Api(_) => crate::proto::PromptMode::Transcript,
+        }
+    }
+
+    /// Whether this backend can emit OpenAI `tool_calls`. API backends pass them
+    /// through; tmuxlet backends need `tools_protocol = true`; CLI backends cannot.
+    pub fn tools_protocol(&self) -> bool {
+        match self {
+            Backend::Tmuxlet(b) => b.tools_protocol,
+            Backend::Api(_) => true,
+            Backend::Cli(_) => false,
         }
     }
 

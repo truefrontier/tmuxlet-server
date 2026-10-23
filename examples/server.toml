@@ -42,6 +42,7 @@ type = "tmuxlet"
 target = "claude"
 target_args = ["--effort", "max"]    # passed through as repeated --target-arg
 cwd = "~"
+# tools_protocol = true              # hold the pane and speak OpenAI tool_calls (opt-in)
 
 # ── Chains ──────────────────────────────────────────────────────────────────
 # Ordered fallback lists. The request `model` selects a chain or a single

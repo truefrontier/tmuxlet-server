@@ -240,17 +240,35 @@ fn run_inner(
             ));
             continue;
         };
+        let held_here = sess
+            .as_ref()
+            .and_then(|s| s.held_run.clone())
+            .filter(|h| h.backend == name);
+        let continuing = held_here.is_some();
         // U-20: reserve a concurrency slot (RAII: released on Drop, even on a
-        // dispatch panic). At the cap this leg is Busy and the chain advances.
-        let _slot = match backend.max_concurrent() {
-            Some(max) => match ActiveSlot::try_acquire(&state.active, name, max) {
-                Some(slot) => Some(slot),
-                None => {
-                    errors.push(BackendError::Busy(name.to_string()));
-                    continue;
+        // dispatch panic). A held pane already occupies the cap for this
+        // conversation, so a continue must not take a second slot. Other
+        // conversations still see held panes toward max_concurrent.
+        let _slot = if continuing {
+            None
+        } else {
+            match backend.max_concurrent() {
+                Some(max) => {
+                    let max = max.saturating_sub(state.sessions.held_count_for(name));
+                    if max == 0 {
+                        errors.push(BackendError::Busy(name.to_string()));
+                        continue;
+                    }
+                    match ActiveSlot::try_acquire(&state.active, name, max) {
+                        Some(slot) => Some(slot),
+                        None => {
+                            errors.push(BackendError::Busy(name.to_string()));
+                            continue;
+                        }
+                    }
                 }
-            },
-            None => None,
+                None => None,
+            }
         };
         // P-6: clamp the leg timeout to the remaining budget.
         let leg_to = backend.timeout_override().unwrap_or(default_to);
@@ -259,26 +277,48 @@ fn run_inner(
             None => leg_to,
         };
         let leg_start = Instant::now();
-        let leg_prompt = match backend.prompt_mode() {
-            PromptMode::LastUser => last_user,
-            PromptMode::Transcript => prompt,
+        let mut leg_prompt = match backend.prompt_mode() {
+            PromptMode::LastUser => last_user.to_string(),
+            PromptMode::Transcript => prompt.to_string(),
         };
+        if backend.tools_protocol() && !continuing {
+            if let Some(block) = crate::proto::openai::tools_appendix_from_raw(raw_value) {
+                leg_prompt.push_str(&block);
+            }
+        }
         // §9.2: stream only when the caller wants it, the backend can do it, and
         // no gate is waiting to reject this leg — a gate needs the whole answer
         // before it can judge, and there is no un-sending a relayed token.
-        let can_stream = on_delta.is_some() && backend.supports_streaming() && judge.is_none();
-        let result = match (&mut on_delta, can_stream) {
-            (Some((sink, committed)), true) => {
-                let mut wrapped = |d: &str| {
-                    // The commit point (§9.2). Recorded HERE rather than in the
-                    // caller's closure so the loop below can see it: once a
-                    // `data:` frame has gone out there is no un-sending it.
-                    **committed = true;
-                    sink(d)
-                };
-                backend.dispatch_stream(leg_prompt, raw_value, &state.env, timeout, &mut wrapped)
+        let can_stream =
+            on_delta.is_some() && backend.supports_streaming() && judge.is_none() && !continuing;
+        let result = if let Some(held) = &held_here {
+            match backend {
+                crate::backend::Backend::Tmuxlet(tb) => crate::backend::tmuxlet::continue_turn(
+                    tb,
+                    &held.run_id,
+                    &crate::proto::openai::continuation_text_from_raw(raw_value),
+                    &state.env,
+                    timeout,
+                ),
+                _ => backend.dispatch(&leg_prompt, raw_value, &state.env, timeout),
             }
-            _ => backend.dispatch(leg_prompt, raw_value, &state.env, timeout),
+        } else {
+            match (&mut on_delta, can_stream) {
+                (Some((sink, committed)), true) => {
+                    let mut wrapped = |d: &str| {
+                        **committed = true;
+                        sink(d)
+                    };
+                    backend.dispatch_stream(
+                        &leg_prompt,
+                        raw_value,
+                        &state.env,
+                        timeout,
+                        &mut wrapped,
+                    )
+                }
+                _ => backend.dispatch(&leg_prompt, raw_value, &state.env, timeout),
+            }
         };
         let committed = on_delta.as_ref().is_some_and(|(_, c)| **c);
         let elapsed_ms = leg_start.elapsed().as_millis() as u64;
@@ -292,7 +332,7 @@ fn run_inner(
                     state,
                     backend,
                     backend_name: name,
-                    prompt: leg_prompt,
+                    prompt: &leg_prompt,
                     session,
                     reqid,
                 };
@@ -329,6 +369,23 @@ fn run_inner(
                 log::info(&format!(
                     "{reqid} ok backend={name} elapsed_ms={elapsed_ms}"
                 ));
+                if let Some(key) = session {
+                    state.sessions.update(key, |st| {
+                        if res.session_held {
+                            if let (Some(run_id), crate::backend::Backend::Tmuxlet(tb)) =
+                                (res.run_id.clone(), backend)
+                            {
+                                st.held_run = Some(crate::route::session::HeldTmuxletRun {
+                                    run_id,
+                                    backend: name.to_string(),
+                                    bin: tb.bin.clone(),
+                                });
+                            }
+                        } else if st.held_run.as_ref().is_some_and(|h| h.backend == name) {
+                            st.held_run = None;
+                        }
+                    });
+                }
                 return Ok((res, name.to_string()));
             }
             Err(e) => {

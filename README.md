@@ -75,7 +75,17 @@ text. On a streaming request the backend header is absent and the route header
 carries no winner: SSE headers are committed before the chain runs, and naming a
 leg that might yet fall through would be a lie.
 
-## Routing
+### OpenAI `tools` / `tool_calls`
+
+`POST /v1/chat/completions` can return real `message.tool_calls` (and `finish_reason: "tool_calls"`):
+
+- **`api` backends** pass upstream `tool_calls` through. `content: null` plus tool calls is success, not a parse error.
+- **`tmuxlet` backends** need `tools_protocol = true`. The first request for an `x-tmuxlet-session-id` (also `x-session-id` / `x-conversation-id`) spawns `tmuxlet -p --tools-protocol` and **holds the pane**. Later turns `tmuxlet send` into that pane and wait on `turn.json`. Timeout is per HTTP turn (`request_timeout_secs`), not one budget for the whole conversation. A held pane counts against `max_concurrent` until TTL / `tmuxlet stop`. Session eviction **stops** the child so TUIs do not leak.
+- **`cli` backends** cannot emit tool calls.
+
+If the request carries a non-empty `tools` array and **no** chain leg can emit `tool_calls`, the server returns **400** naming the limit (same honesty as Anthropic `/v1/messages`, which still refuses `tools`). Do not add `tools_protocol` to `~/.tmuxlet/server.toml` silently — copy the commented example from `examples/server.toml`.
+
+The fake-CLI path proves the protocol. Live Claude/Grok may still ignore “do not use your own tools” even with a narrow allow-list; treat that as an eval, not a guarantee. Held interactive TUIs are heavy. A large dsh system prompt plus schemas should use tmuxlet stdin (`-`).
 
 A request's `model` selects a chain, a single backend, or a `[routers.<name>]`
 table. Two router types:
