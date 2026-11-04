@@ -1,6 +1,6 @@
 # tmuxlet-server — Status & Next Steps
 
-_Last updated: 2026-07-10_
+_Last updated: 2026-11-03_
 
 ## TL;DR
 
@@ -11,9 +11,9 @@ Phase 4's V2 items (true streaming, P-7, U-22, P-4) remain deferred. A second
 adversarial review (2026-07-10) then found and fixed two behavioral gaps plus a
 test/documentation debt — see "Post-implementation review" below. CI gates are green.
 
-- **Repo:** https://github.com/CodefiLabs/tmuxlet-server
-- **Branch:** `feat/optimization-spec` (based on `origin/main` = v0.1.1)
-- **Tests:** 128 passing (81 unit + 47 integration across 10 binaries)
+- **Repo:** https://github.com/truefrontier/tmuxlet-server
+- **Branch:** `main`. `feat/optimization-spec` merged and shipped as **v0.2.0** (2026-07-10)
+- **Tests:** 147 passing (84 unit + 63 integration across 11 binaries)
 - **Gates:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, full suite — all clean
 - **Spec:** [`docs/specs/2026-07-09-optimization-spec.md`](specs/2026-07-09-optimization-spec.md)
 
@@ -146,13 +146,24 @@ plan advised.
 - **P-9 `Retry-After`** is not yet honored for 429 (uses `cooldown_secs`);
   documented in `cooldown_for`.
 
+## Lint/test pass (2026-11-03)
+
+Fixed, each with a test that failed first: `--check-backends` now resolves a bare
+cli `bin` (such as `bin = "agy"`) on PATH instead of reporting a false FAIL; the
+api backend drops `stream_options` along with `stream`; an IPv6 upstream gets a
+bracketed `Host` header. New `tests/chat_paths.rs` covers the router classifier,
+cooldown skips, the chain budget, empty output, the streaming failure path, and
+request-body errors. `cargo doc` is clean under `-D warnings`.
+
 ## Next steps (suggested)
 
-1. **Open the PR** from `feat/optimization-spec` into `main` and let CI run the
-   gates on Linux + macOS.
+1. ~~**Open the PR** from `feat/optimization-spec` into `main`~~ — done: merged
+   to `main`, CI green on Linux + macOS.
 2. **Live-smoke** a real `api` upstream (Ollama / OpenRouter) and, if reachable, a
    `tmuxlet` backend end-to-end.
 3. **Exercise the new opt-in paths** manually: auth on (`token` file), CORS from a
    browser client, a `last_user` prompt backend, and a self-signed `ca_file`
    upstream.
-4. **Tag a release** once the PR merges.
+4. ~~**Tag a release** once the PR merges~~ — done: v0.2.0.
+5. **V2 routing:** proposal in
+   [`docs/specs/2026-08-11-v2-routing-architecture.md`](specs/2026-08-11-v2-routing-architecture.md).

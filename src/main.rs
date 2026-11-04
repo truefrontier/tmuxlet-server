@@ -147,7 +147,9 @@ fn check_backends(cfg: &Config, env: &Env) -> bool {
         let b = &cfg.backends[name];
         let (ok, detail) = match b {
             config::Backend::Cli { bin, .. } => {
-                let path = std::path::PathBuf::from(bin);
+                // A bare name (`bin = "agy"`) is found on the captured PATH at
+                // spawn time, so probe the same resolution, not a cwd path.
+                let path = backend::resolve_program(bin, env);
                 if backend::is_executable_file(&path) {
                     (true, path.display().to_string())
                 } else {

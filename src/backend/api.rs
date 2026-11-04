@@ -33,8 +33,9 @@ pub fn split_url(base_url: &str) -> (String, String, u16, String) {
 }
 
 /// Merge order: caller payload -> shallow-merge extra_body (overrides caller) ->
-/// pin model last (neither caller nor extra_body can override). `stream` is
-/// dropped (V1 always requests non-streamed upstream).
+/// pin model last (neither caller nor extra_body can override). `stream` and
+/// `stream_options` are dropped (V1 always requests non-streamed upstream, and
+/// OpenAI rejects `stream_options` without `stream: true`).
 pub fn build_body(
     caller: &serde_json::Value,
     extra: &serde_json::Value,
@@ -49,6 +50,7 @@ pub fn build_body(
         }
         obj.insert("model".into(), serde_json::json!(model));
         obj.remove("stream");
+        obj.remove("stream_options");
     }
     body
 }
@@ -147,6 +149,28 @@ mod tests {
         assert_eq!(body["think"], serde_json::json!(true));
         assert_eq!(body["foo"], serde_json::json!(1));
         assert!(body["messages"].is_array());
+    }
+
+    #[test]
+    fn drops_stream_options_with_stream() {
+        // The upstream call is always non-streamed, and OpenAI rejects
+        // `stream_options` unless `stream` is true. SDKs send
+        // `stream_options: {include_usage: true}` on streaming requests, so
+        // forwarding it would 400 every streamed request to such an upstream.
+        let caller = serde_json::json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        });
+        let body = build_body(&caller, &serde_json::Value::Null, "m");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+        );
     }
 
     #[test]

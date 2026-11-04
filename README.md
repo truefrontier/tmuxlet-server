@@ -5,27 +5,31 @@ A single static Rust binary that exposes an **OpenAI-compatible
 heterogeneous AI backends:
 
 - **`tmuxlet`** — interactive coding CLIs (claude, codex, grok, …) run through
-  [`tmuxlet`](https://github.com/CodefiLabs/tmuxlet).
+  [`tmuxlet`](https://github.com/truefrontier/tmuxlet).
 - **`cli`** — arbitrary CLI tools, optionally in a PTY (for tools like `agy`
   that detect a non-TTY and redirect output). Use the `{prompt}` placeholder in
   `args` to inject the prompt as a flag value (e.g. `args = ["-p", "{prompt}"]`);
   without it the prompt is appended as the final positional argument.
 - **`api`** — any OpenAI-compatible HTTP upstream (Ollama, OpenRouter, …).
 
-> Companion project: [**CodefiLabs/tmuxlet**](https://github.com/CodefiLabs/tmuxlet)
+> Companion project: [**truefrontier/tmuxlet**](https://github.com/truefrontier/tmuxlet)
 > drives the interactive CLIs behind the `tmuxlet` backend.
 
 Downstream clients (Continue, Cursor, Hermes, anything OpenAI-shaped) see one
 endpoint; the routing happens server-side from a TOML config. A request's
-`model` field selects a named chain (or a single backend); the server walks the
-chain in order until one succeeds.
+`model` field selects a named chain, a single backend, or an auto-router (a
+classifier backend picks the chain or backend for each request); the server
+walks the chain in order until one succeeds. An unknown `model` runs `default_chain`, or gets a
+`404` when `strict_models = true`.
 
 ## Install
 
 ```
-cargo install --git https://github.com/CodefiLabs/tmuxlet-server --locked --force
-cp examples/server.toml ~/.tmuxlet/server.toml   # then edit
+cargo install --git https://github.com/truefrontier/tmuxlet-server --locked --force
+mkdir -p ~/.tmuxlet
+cp -n examples/server.toml ~/.tmuxlet/server.toml   # from a clone of this repo; then edit
 tmuxlet-server --validate
+tmuxlet-server --check-backends                   # optional: probe each backend
 tmuxlet-server                                    # serve on 127.0.0.1:3456
 ```
 
@@ -42,7 +46,7 @@ For step-by-step install + service setup + verification, see
 | Method | Path | Behavior |
 |---|---|---|
 | `GET` | `/health` | `{"status":"ok","version":"…","backends":N,"chains":M}` |
-| `GET` | `/v1/models` | OpenAI-compatible list of chain + backend names |
+| `GET` | `/v1/models` | OpenAI-compatible list of router, chain, and backend names |
 | `GET` | `/v1/backends` | per-backend health: `state` (ok\|cooling\|busy\|unknown), consecutive_failures, last_error, last_latency_ms, cooling_secs |
 | `POST` | `/v1/chat/completions` | OpenAI chat completions (JSON or SSE) |
 
@@ -72,14 +76,18 @@ exits, and `api` is a single non-streamed call. So with `stream: true` the
 server sends the `200` status and SSE headers immediately, then emits
 `: keepalive` comment frames every 15s while the backend runs; once the response
 is ready the real frames (role-prime → content → final → `[DONE]`) are emitted
-all at once. True incremental token streaming is V2.
+all at once. True incremental token streaming is V2. Because the headers go out
+first, a streamed auto-router response's `x-tmuxlet-route` header is
+`class/chain`; a non-streamed one adds the winning backend
+(`class/chain/backend`).
 
 ## Dependency budget
 
 Synchronous (no tokio). Direct deps: `tiny_http`, `ctrlc`, `serde`,
 `serde_json`, `toml`, `rustls` (ring backend — no C toolchain), `webpki-roots`,
 `portable-pty`, `nix` (already in-tree via `portable-pty`; used to disable PTY
-echo). ~25 crates including transitive.
+echo). About 50 crates including transitive ones on macOS
+(`cargo tree -e normal`).
 
 ## Status
 
