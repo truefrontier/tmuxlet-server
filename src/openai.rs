@@ -222,7 +222,7 @@ pub struct Delta {
     pub content: Option<String>,
 }
 
-/// V1 buffered streaming: role-prime, one content frame, final, then [DONE].
+/// V1 buffered streaming: role-prime, one content frame, final, then `[DONE]`.
 pub fn stream_frames(id: &str, model: &str, content: &str) -> Vec<String> {
     let created = unix_now();
     let frame = |c: ChunkChoice| {
