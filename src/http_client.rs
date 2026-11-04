@@ -84,6 +84,12 @@ fn request_bytes(host: &str, port: u16, path: &str, bearer: Option<&str>, body: 
     let auth = bearer
         .map(|b| format!("Authorization: Bearer {b}\r\n"))
         .unwrap_or_default();
+    // An IPv6 literal (split_url strips its brackets) must be re-bracketed.
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
     format!(
         "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
@@ -270,6 +276,16 @@ mod tests {
         assert!(r.contains("Authorization: Bearer tok\r\n"));
         assert!(r.contains("Content-Length: 2\r\n"));
         assert!(r.ends_with("\r\n\r\n{}"));
+    }
+
+    #[test]
+    fn brackets_an_ipv6_literal_in_the_host_header() {
+        // split_url strips the brackets from `http://[::1]:11434/v1` (U-19);
+        // RFC 9112 requires them back in Host, where `::1:11434` is invalid.
+        let r = request_bytes("::1", 11434, "/v1/chat/completions", None, "{}");
+        assert!(r.contains("Host: [::1]:11434\r\n"), "{r}");
+        let r = request_bytes("127.0.0.1", 11434, "/v1/chat/completions", None, "{}");
+        assert!(r.contains("Host: 127.0.0.1:11434\r\n"), "{r}");
     }
 
     #[test]
