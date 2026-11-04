@@ -11,7 +11,7 @@ Phase 4's V2 items (true streaming, P-7, U-22, P-4) remain deferred. A second
 adversarial review (2026-07-10) then found and fixed two behavioral gaps plus a
 test/documentation debt — see "Post-implementation review" below. CI gates are green.
 
-- **Repo:** https://github.com/CodefiLabs/tmuxlet-server
+- **Repo:** https://github.com/truefrontier/tmuxlet-server
 - **Branch:** `main`. `feat/optimization-spec` merged and shipped as **v0.2.0** (2026-07-10)
 - **Tests:** 147 passing (84 unit + 63 integration across 11 binaries)
 - **Gates:** `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, full suite — all clean

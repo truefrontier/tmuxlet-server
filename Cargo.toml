@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 description = "OpenAI-compatible HTTP server fronting tmuxlet, CLI tools, and API upstreams via a configurable fallback chain"
 license = "MIT"
-repository = "https://github.com/CodefiLabs/tmuxlet-server"
+repository = "https://github.com/truefrontier/tmuxlet-server"
 
 [[bin]]
 name = "tmuxlet-server"

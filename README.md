@@ -5,14 +5,14 @@ A single static Rust binary that exposes an **OpenAI-compatible
 heterogeneous AI backends:
 
 - **`tmuxlet`** — interactive coding CLIs (claude, codex, grok, …) run through
-  [`tmuxlet`](https://github.com/CodefiLabs/tmuxlet).
+  [`tmuxlet`](https://github.com/truefrontier/tmuxlet).
 - **`cli`** — arbitrary CLI tools, optionally in a PTY (for tools like `agy`
   that detect a non-TTY and redirect output). Use the `{prompt}` placeholder in
   `args` to inject the prompt as a flag value (e.g. `args = ["-p", "{prompt}"]`);
   without it the prompt is appended as the final positional argument.
 - **`api`** — any OpenAI-compatible HTTP upstream (Ollama, OpenRouter, …).
 
-> Companion project: [**CodefiLabs/tmuxlet**](https://github.com/CodefiLabs/tmuxlet)
+> Companion project: [**truefrontier/tmuxlet**](https://github.com/truefrontier/tmuxlet)
 > drives the interactive CLIs behind the `tmuxlet` backend.
 
 Downstream clients (Continue, Cursor, Hermes, anything OpenAI-shaped) see one
@@ -25,7 +25,7 @@ walks the chain in order until one succeeds. An unknown `model` runs `default_ch
 ## Install
 
 ```
-cargo install --git https://github.com/CodefiLabs/tmuxlet-server --locked --force
+cargo install --git https://github.com/truefrontier/tmuxlet-server --locked --force
 mkdir -p ~/.tmuxlet
 cp -n examples/server.toml ~/.tmuxlet/server.toml   # from a clone of this repo; then edit
 tmuxlet-server --validate

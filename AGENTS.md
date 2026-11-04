@@ -34,7 +34,7 @@ If a prerequisite is missing, STOP and tell the user which to install.
 ## Step 2: Install
 
 ```
-cargo install --git https://github.com/CodefiLabs/tmuxlet-server --locked --force
+cargo install --git https://github.com/truefrontier/tmuxlet-server --locked --force
 tmuxlet-server --version
 ```
 Expected: prints `tmuxlet-server <version>`. If not, the `cargo install` failed —
@@ -47,7 +47,7 @@ the repo's `Cargo.lock`. Without it Cargo resolves to the latest releases, and
 
 Steps 3 and 5 (and the optional `./scripts/smoke.sh` in Step 6) use files from
 this repo. `cargo install --git` leaves no checkout, so run them from a clone
-(`git clone --depth 1 https://github.com/CodefiLabs/tmuxlet-server && cd tmuxlet-server`).
+(`git clone --depth 1 https://github.com/truefrontier/tmuxlet-server && cd tmuxlet-server`).
 
 ```
 mkdir -p ~/.tmuxlet
