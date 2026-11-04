@@ -116,5 +116,7 @@ order = ["claude-thinking", "agy"]
 #   research = "thinking"
 #   execution = "default"
 #
-# Observability: the response carries `x-tmuxlet-route: class/chain/backend`, and
-# GET /v1/backends shows per-backend health (state ok|cooling|busy|unknown).
+# Observability: the response carries `x-tmuxlet-route: class/chain/backend`
+# (a streamed response carries `class/chain`: its headers go out before a backend
+# answers), and GET /v1/backends shows per-backend health
+# (state ok|cooling|busy|unknown).
